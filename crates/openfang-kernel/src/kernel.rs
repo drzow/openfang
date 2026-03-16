@@ -5164,10 +5164,10 @@ impl OpenFangKernel {
             .unwrap_or_default();
 
         if !tool_allowlist.is_empty() {
-            all_tools.retain(|t| tool_allowlist.iter().any(|a| a == &t.name));
+            all_tools.retain(|t| tool_allowlist.iter().any(|a| a.to_lowercase() == t.name.to_lowercase()));
         }
         if !tool_blocklist.is_empty() {
-            all_tools.retain(|t| !tool_blocklist.iter().any(|b| b == &t.name));
+            all_tools.retain(|t| !tool_blocklist.iter().any(|b| b.to_lowercase() == t.name.to_lowercase()));
         }
 
         // Step 5: Remove shell_exec if exec_policy denies it.
