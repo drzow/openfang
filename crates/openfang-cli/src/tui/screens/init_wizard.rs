@@ -500,6 +500,10 @@ impl State {
     }
 
     /// Populate model_entries from the catalog for the selected provider.
+    ///
+    /// For local providers (Ollama, LM Studio, vLLM, Lemonade), probes the
+    /// running server's `/models` endpoint first and prepends any discovered
+    /// models with a "running" tier badge.
     fn load_models_for_provider(&mut self) {
         self.model_entries.clear();
         let p = match self.provider() {
@@ -507,10 +511,37 @@ impl State {
             None => return,
         };
 
+        // For local providers, probe the server for running models.
+        let live_ids = if is_local_provider(p.name) {
+            let base_url = local_provider_base_url(p.name);
+            probe_local_models(&base_url)
+        } else {
+            Vec::new()
+        };
+
+        // Track IDs we've already added to avoid duplicates.
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Prepend running models.
+        for id in &live_ids {
+            seen_ids.insert(id.clone());
+            self.model_entries.push(ModelEntry {
+                id: id.clone(),
+                display_name: id.clone(),
+                tier: "running",
+                cost: "free".to_string(),
+            });
+        }
+
+        // Add catalog models, skipping any already listed from live probe.
         let models = self.model_catalog.models_by_provider(p.name);
         let mut default_idx = 0usize;
 
-        for (i, m) in models.iter().enumerate() {
+        for m in &models {
+            if seen_ids.contains(&m.id) {
+                continue;
+            }
+
             let tier = tier_label(m.tier);
             let cost = if m.input_cost_per_m == 0.0 && m.output_cost_per_m == 0.0 {
                 "free".to_string()
@@ -518,16 +549,24 @@ impl State {
                 format!("${:.2}/${:.2}", m.input_cost_per_m, m.output_cost_per_m)
             };
 
-            if m.id == p.default_model {
-                default_idx = i;
-            }
-
             self.model_entries.push(ModelEntry {
                 id: m.id.clone(),
                 display_name: m.display_name.clone(),
                 tier,
                 cost,
             });
+        }
+
+        // Find the default: prefer first live model, else the provider default.
+        if !live_ids.is_empty() {
+            default_idx = 0;
+        } else {
+            for (i, entry) in self.model_entries.iter().enumerate() {
+                if entry.id == p.default_model {
+                    default_idx = i;
+                    break;
+                }
+            }
         }
 
         if self.model_entries.is_empty() {
@@ -624,6 +663,72 @@ fn tier_label(tier: ModelTier) -> &'static str {
         ModelTier::Local => "local",
         ModelTier::Custom => "custom",
     }
+}
+
+/// Returns true for providers that run locally and expose an OpenAI-compatible
+/// `/models` endpoint we can probe.
+fn is_local_provider(name: &str) -> bool {
+    matches!(name, "ollama" | "lmstudio" | "vllm" | "lemonade")
+}
+
+/// Return the base URL for a local provider.
+fn local_provider_base_url(name: &str) -> String {
+    use openfang_types::model_catalog::{
+        LEMONADE_BASE_URL, LMSTUDIO_BASE_URL, OLLAMA_BASE_URL, VLLM_BASE_URL,
+    };
+    match name {
+        "ollama" => OLLAMA_BASE_URL.to_string(),
+        "lmstudio" => LMSTUDIO_BASE_URL.to_string(),
+        "vllm" => VLLM_BASE_URL.to_string(),
+        "lemonade" => LEMONADE_BASE_URL.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Parse an OpenAI-compatible `/models` response into a list of model IDs.
+///
+/// Expected format: `{ "data": [{ "id": "model-name" }, ...] }`
+fn parse_models_response(body: &serde_json::Value) -> Vec<String> {
+    let models = match body.get("data").and_then(|d| d.as_array()) {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+
+    models
+        .iter()
+        .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .collect()
+}
+
+/// Probe a local server's OpenAI-compatible `/models` endpoint to discover
+/// loaded models. Returns an empty vec on any error (server not running,
+/// timeout, parse failure).
+fn probe_local_models(base_url: &str) -> Vec<String> {
+    if base_url.is_empty() {
+        return Vec::new();
+    }
+
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let resp = match client.get(&url).send() {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Vec::new(),
+    };
+
+    let body: serde_json::Value = match resp.json() {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    parse_models_response(&body)
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────
@@ -2383,6 +2488,9 @@ fn build_model_list_items<'a>(
             };
 
             let tier_style = match entry.tier {
+                "running" => Style::default()
+                    .fg(theme::GREEN)
+                    .add_modifier(Modifier::BOLD),
                 "frontier" => Style::default().fg(theme::PURPLE),
                 "smart" => Style::default().fg(theme::BLUE),
                 "balanced" => Style::default().fg(theme::YELLOW),
@@ -2644,4 +2752,85 @@ fn draw_complete(f: &mut Frame, area: Rect, state: &mut State) {
         )])),
         chunks[15],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_local_provider() {
+        assert!(is_local_provider("ollama"));
+        assert!(is_local_provider("lmstudio"));
+        assert!(is_local_provider("vllm"));
+        assert!(is_local_provider("lemonade"));
+        assert!(!is_local_provider("openai"));
+        assert!(!is_local_provider("groq"));
+        assert!(!is_local_provider("anthropic"));
+    }
+
+    #[test]
+    fn test_local_provider_base_url() {
+        assert_eq!(
+            local_provider_base_url("ollama"),
+            "http://localhost:11434/v1"
+        );
+        assert_eq!(
+            local_provider_base_url("lmstudio"),
+            "http://localhost:1234/v1"
+        );
+        assert_eq!(
+            local_provider_base_url("vllm"),
+            "http://localhost:8000/v1"
+        );
+        assert!(local_provider_base_url("openai").is_empty());
+    }
+
+    #[test]
+    fn test_parse_models_response_valid() {
+        let body = serde_json::json!({
+            "data": [
+                {"id": "llama3.2", "object": "model"},
+                {"id": "codellama:7b", "object": "model"},
+                {"id": "mistral:latest", "object": "model"}
+            ]
+        });
+        let models = parse_models_response(&body);
+        assert_eq!(models, vec!["llama3.2", "codellama:7b", "mistral:latest"]);
+    }
+
+    #[test]
+    fn test_parse_models_response_empty_data() {
+        let body = serde_json::json!({"data": []});
+        assert!(parse_models_response(&body).is_empty());
+    }
+
+    #[test]
+    fn test_parse_models_response_missing_data() {
+        let body = serde_json::json!({"models": []});
+        assert!(parse_models_response(&body).is_empty());
+    }
+
+    #[test]
+    fn test_parse_models_response_missing_id() {
+        let body = serde_json::json!({
+            "data": [
+                {"name": "llama3.2"},
+                {"id": "mistral:latest"}
+            ]
+        });
+        let models = parse_models_response(&body);
+        assert_eq!(models, vec!["mistral:latest"]);
+    }
+
+    #[test]
+    fn test_parse_models_response_null_body() {
+        let body = serde_json::Value::Null;
+        assert!(parse_models_response(&body).is_empty());
+    }
+
+    #[test]
+    fn test_probe_local_models_empty_url() {
+        assert!(probe_local_models("").is_empty());
+    }
 }
