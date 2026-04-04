@@ -50,6 +50,11 @@ pub fn bundled_hands() -> Vec<(&'static str, &'static str, &'static str)> {
             include_str!("../bundled/infisical-sync/HAND.toml"),
             include_str!("../bundled/infisical-sync/SKILL.md"),
         ),
+        (
+            "config-sync",
+            include_str!("../bundled/config-sync/HAND.toml"),
+            include_str!("../bundled/config-sync/SKILL.md"),
+        ),
     ]
 }
 
@@ -81,7 +86,7 @@ mod tests {
     #[test]
     fn bundled_hands_count() {
         let hands = bundled_hands();
-        assert_eq!(hands.len(), 9);
+        assert_eq!(hands.len(), 10);
     }
 
     #[test]
@@ -253,6 +258,7 @@ mod tests {
             "researcher",
             "twitter",
             "trader",
+            "config-sync",
         ];
         for (id, toml_content, skill_content) in bundled_hands() {
             if einstein_ids.contains(&id) {
@@ -285,6 +291,7 @@ mod tests {
             "researcher",
             "twitter",
             "trader",
+            "config-sync",
         ];
         for (id, toml_content, skill_content) in bundled_hands() {
             if einstein_ids.contains(&id) {
@@ -424,6 +431,56 @@ mod tests {
     }
 
     #[test]
+    fn parse_config_sync_hand() {
+        let (id, toml_content, skill_content) = bundled_hands()
+            .into_iter()
+            .find(|(id, _, _)| *id == "config-sync")
+            .expect("config-sync hand must be in bundled_hands()");
+        let def = parse_bundled(id, toml_content, skill_content).unwrap();
+        assert_eq!(def.id, "config-sync");
+        assert_eq!(def.name, "Config Sync Hand");
+        assert_eq!(def.category, crate::HandCategory::Productivity);
+        assert!(def.skill_content.is_some());
+        // Required binaries
+        assert!(!def.requires.is_empty());
+        let req_keys: Vec<&str> = def.requires.iter().map(|r| r.key.as_str()).collect();
+        assert!(req_keys.contains(&"git"), "must require git");
+        assert!(req_keys.contains(&"keybase"), "must require keybase");
+        // Einstein scheduling tools
+        assert!(def.tools.contains(&"schedule_create".to_string()));
+        assert!(def.tools.contains(&"schedule_list".to_string()));
+        assert!(def.tools.contains(&"schedule_delete".to_string()));
+        // Memory tools
+        assert!(def.tools.contains(&"memory_store".to_string()));
+        assert!(def.tools.contains(&"memory_recall".to_string()));
+        // Knowledge graph tools
+        assert!(def.tools.contains(&"knowledge_add_entity".to_string()));
+        assert!(def.tools.contains(&"knowledge_add_relation".to_string()));
+        assert!(def.tools.contains(&"knowledge_query".to_string()));
+        // Event bus
+        assert!(def.tools.contains(&"event_publish".to_string()));
+        // Shell access for git commands
+        assert!(def.tools.contains(&"shell_exec".to_string()));
+        // Dashboard
+        assert!(!def.dashboard.metrics.is_empty());
+        let metric_keys: Vec<&str> = def
+            .dashboard
+            .metrics
+            .iter()
+            .map(|m| m.memory_key.as_str())
+            .collect();
+        assert!(metric_keys.contains(&"config_sync_total_syncs"));
+        assert!(metric_keys.contains(&"config_sync_last_sync"));
+        assert!(metric_keys.contains(&"config_sync_keybase_status"));
+        // Agent config
+        assert!(!def.agent.system_prompt.is_empty());
+        assert!(
+            def.agent.temperature < 0.2,
+            "ops hand should use low temperature"
+        );
+    }
+
+    #[test]
     fn all_einstein_hands_have_knowledge_graph() {
         let einstein_ids = [
             "lead",
@@ -432,6 +489,7 @@ mod tests {
             "researcher",
             "twitter",
             "trader",
+            "config-sync",
         ];
         for (id, toml_content, skill_content) in bundled_hands() {
             if einstein_ids.contains(&id) {
