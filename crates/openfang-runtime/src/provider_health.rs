@@ -10,6 +10,16 @@
 use dashmap::DashMap;
 use std::time::{Duration, Instant};
 
+/// A model discovered from a local provider with optional runtime metadata.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DiscoveredModel {
+    /// Model identifier (e.g. `"llama3.2:latest"`).
+    pub id: String,
+    /// Actual runtime context window in tokens (e.g. from Ollama's `num_ctx`),
+    /// or `None` if the provider does not report it.
+    pub context_window: Option<u64>,
+}
+
 /// Result of probing a provider endpoint.
 #[derive(Debug, Clone, Default)]
 pub struct ProbeResult {
@@ -17,10 +27,17 @@ pub struct ProbeResult {
     pub reachable: bool,
     /// Round-trip latency in milliseconds.
     pub latency_ms: u64,
-    /// Model IDs discovered from the provider's listing endpoint.
-    pub discovered_models: Vec<String>,
+    /// Models discovered from the provider's listing endpoint.
+    pub discovered_models: Vec<DiscoveredModel>,
     /// Error message if the probe failed.
     pub error: Option<String>,
+}
+
+impl ProbeResult {
+    /// Model IDs as plain strings (convenience accessor).
+    pub fn model_ids(&self) -> Vec<String> {
+        self.discovered_models.iter().map(|m| m.id.clone()).collect()
+    }
 }
 
 /// Check if a provider is a local provider (no key required, localhost URL).
@@ -117,12 +134,13 @@ pub async fn probe_provider(provider: &str, base_url: &str) -> ProbeResult {
 
     // Ollama uses a non-OpenAI endpoint for model listing
     let (url, is_ollama) = if lower == "ollama" {
-        // base_url is typically "http://localhost:11434/v1" — strip /v1 for the tags endpoint
+        // base_url is typically "http://localhost:11434/v1" — strip /v1 for the ps endpoint
         let root = base_url
             .trim_end_matches('/')
             .trim_end_matches("/v1")
             .trim_end_matches("/v1/");
-        (format!("{root}/api/tags"), true)
+        // Use /api/ps to list only currently running/loaded models
+        (format!("{root}/api/ps"), true)
     } else {
         // OpenAI-compatible: GET {base_url}/models
         let trimmed = base_url.trim_end_matches('/');
@@ -163,8 +181,8 @@ pub async fn probe_provider(provider: &str, base_url: &str) -> ProbeResult {
     let latency_ms = start.elapsed().as_millis() as u64;
 
     // Parse model names
-    let models = if is_ollama {
-        // Ollama: { "models": [ { "name": "llama3.2:latest", ... }, ... ] }
+    let model_names: Vec<String> = if is_ollama {
+        // Ollama /api/ps: { "models": [ { "name": "model:latest", ... }, ... ] }
         body.get("models")
             .and_then(|v| v.as_array())
             .map(|arr| {
@@ -189,12 +207,91 @@ pub async fn probe_provider(provider: &str, base_url: &str) -> ProbeResult {
             .unwrap_or_default()
     };
 
+    // For Ollama, enrich each model with actual context window from /api/show
+    let models = if is_ollama {
+        let root = base_url
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .trim_end_matches("/v1/");
+        let show_url = format!("{root}/api/show");
+        let mut enriched = Vec::with_capacity(model_names.len());
+        for name in &model_names {
+            let ctx = fetch_ollama_context_window(&client, &show_url, name).await;
+            enriched.push(DiscoveredModel {
+                id: name.clone(),
+                context_window: ctx,
+            });
+        }
+        enriched
+    } else {
+        model_names
+            .into_iter()
+            .map(|id| DiscoveredModel {
+                id,
+                context_window: None,
+            })
+            .collect()
+    };
+
     ProbeResult {
         reachable: true,
         latency_ms,
         discovered_models: models,
         error: None,
     }
+}
+
+/// Query Ollama's `/api/show` for a model's runtime context window.
+///
+/// Checks the `parameters` text for `num_ctx` (the actual runtime value),
+/// then falls back to `model_info.<arch>.context_length` (the model's max).
+/// Returns `None` if the call fails or neither field is found.
+async fn fetch_ollama_context_window(
+    client: &reqwest::Client,
+    show_url: &str,
+    model_name: &str,
+) -> Option<u64> {
+    let body = serde_json::json!({"name": model_name});
+    let resp = client.post(show_url).json(&body).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    parse_ollama_context_window(&json)
+}
+
+/// Parse the context window from an Ollama `/api/show` response.
+///
+/// Priority:
+/// 1. `parameters` string containing `num_ctx <value>` (runtime config)
+/// 2. `model_info.<arch>.context_length` (model's theoretical max)
+fn parse_ollama_context_window(json: &serde_json::Value) -> Option<u64> {
+    // Primary: parse num_ctx from the parameters text
+    if let Some(params) = json.get("parameters").and_then(|v| v.as_str()) {
+        for line in params.lines() {
+            let line = line.trim();
+            if line.starts_with("num_ctx") {
+                if let Some(val) = line.split_whitespace().nth(1) {
+                    if let Ok(n) = val.parse::<u64>() {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: model_info.<arch>.context_length
+    if let Some(info) = json.get("model_info").and_then(|v| v.as_object()) {
+        for (key, val) in info {
+            if key.ends_with(".context_length") {
+                if let Some(n) = val.as_u64() {
+                    return Some(n);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Probe a provider, returning a cached result when available.
@@ -347,14 +444,19 @@ mod tests {
         let result = ProbeResult {
             reachable: true,
             latency_ms: 42,
-            discovered_models: vec!["llama3".into()],
+            discovered_models: vec![DiscoveredModel {
+                id: "llama3".into(),
+                context_window: Some(4096),
+            }],
             error: None,
         };
         cache.insert("ollama", result.clone());
         let cached = cache.get("ollama").expect("should be cached");
         assert!(cached.reachable);
         assert_eq!(cached.latency_ms, 42);
-        assert_eq!(cached.discovered_models, vec!["llama3".to_string()]);
+        assert_eq!(cached.discovered_models.len(), 1);
+        assert_eq!(cached.discovered_models[0].id, "llama3");
+        assert_eq!(cached.discovered_models[0].context_window, Some(4096));
     }
 
     #[test]
@@ -362,5 +464,57 @@ mod tests {
         let cache = ProbeCache::default();
         assert!(cache.get("anything").is_none());
         assert_eq!(cache.ttl, Duration::from_secs(PROBE_CACHE_TTL_SECS));
+    }
+
+    #[test]
+    fn test_probe_result_model_ids() {
+        let result = ProbeResult {
+            reachable: true,
+            latency_ms: 10,
+            discovered_models: vec![
+                DiscoveredModel { id: "a".into(), context_window: Some(4096) },
+                DiscoveredModel { id: "b".into(), context_window: None },
+            ],
+            error: None,
+        };
+        assert_eq!(result.model_ids(), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_ollama_num_ctx_from_parameters() {
+        let json = serde_json::json!({
+            "parameters": "num_ctx                        4096\ntemperature                    0.7"
+        });
+        assert_eq!(parse_ollama_context_window(&json), Some(4096));
+    }
+
+    #[test]
+    fn test_parse_ollama_context_length_fallback() {
+        let json = serde_json::json!({
+            "model_info": { "qwen2.context_length": 32768 }
+        });
+        assert_eq!(parse_ollama_context_window(&json), Some(32768));
+    }
+
+    #[test]
+    fn test_parse_ollama_num_ctx_takes_priority() {
+        let json = serde_json::json!({
+            "parameters": "num_ctx 4096",
+            "model_info": { "llama.context_length": 131072 }
+        });
+        // num_ctx (runtime) takes priority over model_info (theoretical max)
+        assert_eq!(parse_ollama_context_window(&json), Some(4096));
+    }
+
+    #[test]
+    fn test_parse_ollama_no_context_info() {
+        let json = serde_json::json!({"parameters": "temperature 0.7"});
+        assert_eq!(parse_ollama_context_window(&json), None);
+    }
+
+    #[test]
+    fn test_parse_ollama_empty_response() {
+        let json = serde_json::json!({});
+        assert_eq!(parse_ollama_context_window(&json), None);
     }
 }

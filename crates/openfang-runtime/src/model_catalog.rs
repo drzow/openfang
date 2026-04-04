@@ -366,8 +366,14 @@ impl ModelCatalog {
     /// Merge dynamically discovered models from a local provider.
     ///
     /// Adds models not already in the catalog with `Local` tier and zero cost.
+    /// When a model already exists, updates its `context_window` and
+    /// `max_output_tokens` if the probe returned a runtime value.
     /// Also updates the provider's `model_count`.
-    pub fn merge_discovered_models(&mut self, provider: &str, model_ids: &[String]) {
+    pub fn merge_discovered_models(
+        &mut self,
+        provider: &str,
+        models: &[crate::provider_health::DiscoveredModel],
+    ) {
         let existing_ids: std::collections::HashSet<String> = self
             .models
             .iter()
@@ -376,19 +382,31 @@ impl ModelCatalog {
             .collect();
 
         let mut added = 0usize;
-        for id in model_ids {
-            if existing_ids.contains(&id.to_lowercase()) {
+        for model in models {
+            if existing_ids.contains(&model.id.to_lowercase()) {
+                // Update context_window on existing entries if we have a real value
+                if let Some(ctx) = model.context_window {
+                    if let Some(entry) = self.models.iter_mut().find(|m| {
+                        m.provider == provider
+                            && m.id.to_lowercase() == model.id.to_lowercase()
+                    }) {
+                        entry.context_window = ctx;
+                        entry.max_output_tokens = std::cmp::min(ctx / 2, entry.max_output_tokens);
+                    }
+                }
                 continue;
             }
+            let ctx = model.context_window.unwrap_or(131_072);
+            let max_out = std::cmp::min(ctx / 2, 16_384);
             // Generate a human-friendly display name
-            let display = format!("{} ({})", id, provider);
+            let display = format!("{} ({})", model.id, provider);
             self.models.push(ModelCatalogEntry {
-                id: id.clone(),
+                id: model.id.clone(),
                 display_name: display,
                 provider: provider.to_string(),
                 tier: ModelTier::Local,
-                context_window: 131_072,
-                max_output_tokens: 16_384,
+                context_window: ctx,
+                max_output_tokens: max_out,
                 input_cost_per_m: 0.0,
                 output_cost_per_m: 0.0,
                 supports_tools: true,
@@ -4081,11 +4099,15 @@ mod tests {
 
     #[test]
     fn test_merge_adds_new_models() {
+        use crate::provider_health::DiscoveredModel;
         let mut catalog = ModelCatalog::new();
         let before = catalog.models_by_provider("ollama").len();
         catalog.merge_discovered_models(
             "ollama",
-            &["codestral:latest".to_string(), "qwen2:7b".to_string()],
+            &[
+                DiscoveredModel { id: "codestral:latest".into(), context_window: Some(8192) },
+                DiscoveredModel { id: "qwen2:7b".into(), context_window: Some(32768) },
+            ],
         );
         let after = catalog.models_by_provider("ollama").len();
         assert_eq!(after, before + 2);
@@ -4093,25 +4115,77 @@ mod tests {
         let qwen = catalog.find_model("qwen2:7b").unwrap();
         assert_eq!(qwen.tier, ModelTier::Local);
         assert!((qwen.input_cost_per_m).abs() < f64::EPSILON);
+        // Verify context window was set from discovered value
+        assert_eq!(qwen.context_window, 32768);
+        assert_eq!(qwen.max_output_tokens, 16384); // min(32768/2, 16384)
     }
 
     #[test]
     fn test_merge_skips_existing() {
+        use crate::provider_health::DiscoveredModel;
         let mut catalog = ModelCatalog::new();
         // "llama3.2" is already a builtin Ollama model
         let before = catalog.list_models().len();
-        catalog.merge_discovered_models("ollama", &["llama3.2".to_string()]);
+        catalog.merge_discovered_models(
+            "ollama",
+            &[DiscoveredModel { id: "llama3.2".into(), context_window: None }],
+        );
         let after = catalog.list_models().len();
         assert_eq!(after, before); // no new model added
     }
 
     #[test]
     fn test_merge_updates_model_count() {
+        use crate::provider_health::DiscoveredModel;
         let mut catalog = ModelCatalog::new();
         let before_count = catalog.get_provider("ollama").unwrap().model_count;
-        catalog.merge_discovered_models("ollama", &["new-model:latest".to_string()]);
+        catalog.merge_discovered_models(
+            "ollama",
+            &[DiscoveredModel { id: "new-model:latest".into(), context_window: None }],
+        );
         let after_count = catalog.get_provider("ollama").unwrap().model_count;
         assert_eq!(after_count, before_count + 1);
+    }
+
+    #[test]
+    fn test_merge_uses_discovered_context_window() {
+        use crate::provider_health::DiscoveredModel;
+        let mut catalog = ModelCatalog::new();
+        catalog.merge_discovered_models(
+            "ollama",
+            &[DiscoveredModel { id: "small-ctx-model:latest".into(), context_window: Some(4096) }],
+        );
+        let model = catalog.find_model("small-ctx-model:latest").unwrap();
+        assert_eq!(model.context_window, 4096);
+        assert_eq!(model.max_output_tokens, 2048); // min(4096/2, 16384) = 2048
+    }
+
+    #[test]
+    fn test_merge_fallback_context_window_when_none() {
+        use crate::provider_health::DiscoveredModel;
+        let mut catalog = ModelCatalog::new();
+        catalog.merge_discovered_models(
+            "ollama",
+            &[DiscoveredModel { id: "unknown-ctx-model:latest".into(), context_window: None }],
+        );
+        let model = catalog.find_model("unknown-ctx-model:latest").unwrap();
+        assert_eq!(model.context_window, 131_072); // fallback
+    }
+
+    #[test]
+    fn test_merge_updates_existing_model_context_window() {
+        use crate::provider_health::DiscoveredModel;
+        let mut catalog = ModelCatalog::new();
+        // llama3.2 is a builtin — check its default context window
+        let before = catalog.find_model("llama3.2").unwrap().context_window;
+        assert!(before > 4096, "builtin should have large default context");
+        // Now merge with a discovered runtime value of 4096
+        catalog.merge_discovered_models(
+            "ollama",
+            &[DiscoveredModel { id: "llama3.2".into(), context_window: Some(4096) }],
+        );
+        let after = catalog.find_model("llama3.2").unwrap().context_window;
+        assert_eq!(after, 4096); // updated to actual runtime value
     }
 
     #[test]
@@ -4403,10 +4477,14 @@ mod tests {
     /// over builtins in case-insensitive lookups.
     #[test]
     fn test_discovered_local_model_preferred() {
+        use crate::provider_health::DiscoveredModel;
         let mut catalog = ModelCatalog::new();
 
         // merge_discovered_models adds models with Local tier
-        catalog.merge_discovered_models("ollama", &["Custom-Model-7B".to_string()]);
+        catalog.merge_discovered_models(
+            "ollama",
+            &[DiscoveredModel { id: "Custom-Model-7B".into(), context_window: None }],
+        );
 
         // Verify it was added
         let found = catalog.find_model("Custom-Model-7B").unwrap();
