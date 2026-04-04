@@ -129,34 +129,51 @@ For config repos, `git add -A` is appropriate because all files in the repo are 
 
 ## Keybase Channel Integration
 
-### Keybase Chat CLI Reference
+All Keybase chat operations use the JSON pipe API (`keybase chat api`) rather than the positional CLI commands. This provides structured input/output and more reliable parsing.
 
-The Keybase CLI provides chat commands for sending and reading messages in team channels.
+### Keybase Chat API Reference
 
 **Sending a message to a team channel**:
 ```bash
-keybase chat send --channel <channel_name> <team_name> "<message>"
+printf '{"method":"send","params":{"options":{"channel":{"name":"%s","topic_name":"%s","members_type":"team"},"message":{"body":"%s"}}}}' "<team>" "<channel>" "<message>" | keybase chat api
 ```
 Example:
 ```bash
-keybase chat send --channel info drzowbot "config-sync (myhost): pushed 3 commits to main. 2026-04-03T12:00:00Z"
+printf '{"method":"send","params":{"options":{"channel":{"name":"%s","topic_name":"info","members_type":"team"},"message":{"body":"%s"}}}}' "drzowbot" "config-sync (myhost): pushed 3 commits to main. 2026-04-03T12:00:00Z" | keybase chat api
 ```
+The response JSON contains `result.message` on success or `error` on failure.
 
 **Reading recent messages from a team channel**:
 ```bash
-keybase chat read --channel <channel_name> <team_name> --since "<duration>" 2>&1
+echo '{"method":"read","params":{"options":{"channel":{"name":"<team>","topic_name":"<channel>","members_type":"team"},"pagination":{"num":<count>}}}}' | keybase chat api
 ```
 Example:
 ```bash
-keybase chat read --channel info drzowbot --since "1h" 2>&1
+echo '{"method":"read","params":{"options":{"channel":{"name":"drzowbot","topic_name":"info","members_type":"team"},"pagination":{"num":20}}}}' | keybase chat api
 ```
-The `--since` flag accepts durations like `1h`, `30m`, `1d`.
+The response contains `result.messages[]`. Each message has:
+- `msg.content.text.body` — the message text
+- `msg.sent_at` — Unix timestamp (seconds)
+- `msg.sent_at_ms` — Unix timestamp (milliseconds, higher precision)
+- `msg.sender.username` — who sent it
+
+**Listening for real-time messages**:
+```bash
+timeout <seconds> keybase chat api-listen 2>/dev/null || true
+```
+Emits one JSON object per line to stdout as messages arrive. Each line contains:
+- `msg.content.text.body` — the message text
+- `msg.channel.name` — the team name
+- `msg.channel.topic_name` — the channel name
+- `msg.sender.username` — who sent it
+
+The `timeout` wrapper ensures the listener exits after a bounded wait. The `|| true` prevents a non-zero exit code from aborting the script.
 
 **Listing channels in a team**:
 ```bash
-keybase chat list --topic-type chat <team_name>
+echo '{"method":"listconvsonname","params":{"options":{"name":"<team>","members_type":"team","topic_type":"chat"}}}' | keybase chat api
 ```
-This lists all channels the current user has access to within the team. Use it to verify that `#info` and `#alerts` channels exist before attempting to send.
+The response contains `result.conversations[]`. Each conversation has `channel.topic_name` indicating the channel name. Use this to verify that `#info` and `#alerts` channels exist before attempting to send.
 
 ### Notification Patterns
 
@@ -183,15 +200,19 @@ The `@drzow` mention in error alerts ensures the user gets a Keybase notificatio
 
 Other instances post push notifications to the `#info` channel. By monitoring this channel, an instance can trigger an immediate sync when another instance pushes changes, rather than waiting for its next scheduled run.
 
-**Reading recent messages**:
-```bash
-keybase chat read --channel info drzowbot --since "1h" 2>&1
-```
+The listening strategy is a hybrid of history read and real-time listen:
 
-**Parsing for push events**: Look for lines matching the pattern:
+**Step A -- Read recent history**:
+```bash
+echo '{"method":"read","params":{"options":{"channel":{"name":"drzowbot","topic_name":"info","members_type":"team"},"pagination":{"num":20}}}}' | keybase chat api
 ```
-config-sync (<hostname>): pushed
+Parse `result.messages[]` and check each message's `msg.content.text.body` for the pattern `config-sync (<hostname>): pushed`. Filter by `msg.sent_at_ms` to only consider messages from the last hour. Compare the hostname in the message against `$(hostname)` -- only react to messages from OTHER hostnames.
+
+**Step B -- Briefly listen for real-time**:
+```bash
+timeout 5 keybase chat api-listen 2>/dev/null || true
 ```
+Parse each JSON line for matching push notifications from other hostnames.
 
 **Filtering out own messages**: Compare the hostname in the message against the local hostname:
 ```bash
@@ -199,7 +220,7 @@ local_host=$(hostname)
 # Only react to messages where the hostname does NOT match $local_host
 ```
 
-If the message hostname matches the local hostname, ignore it — that was our own push. Only messages from OTHER hostnames should trigger a sync.
+If the message hostname matches the local hostname, ignore it -- that was our own push. Only messages from OTHER hostnames should trigger a sync.
 
 **Timing**: Check the #info channel at the start of each activation (Phase 2.6). If a push notification from another instance is found within the lookback window (default 1 hour), proceed with an immediate sync regardless of the normal schedule. This provides event-driven sync with the daily schedule as a fallback.
 
@@ -214,9 +235,9 @@ Before sending any notifications, verify team membership and channel access:
 
 2. **Check channel access**:
    ```bash
-   keybase chat list --topic-type chat <team_name> 2>&1
+   echo '{"method":"listconvsonname","params":{"options":{"name":"<team_name>","members_type":"team","topic_type":"chat"}}}' | keybase chat api
    ```
-   Verify that both `#info` and `#alerts` appear in the output.
+   Parse `result.conversations[]` and verify that entries with `channel.topic_name` of `info` and `alerts` exist.
 
 3. **Graceful degradation**: If channels are not accessible (team not joined, channels don't exist, Keybase not logged in), log a warning but do NOT abort the sync. Git operations are the primary mission; notifications are secondary. Store the warning:
    ```

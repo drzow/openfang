@@ -237,10 +237,10 @@ If `keybase_notify` is enabled, verify that the configured team channels are acc
 
 1. **Check #info channel access**:
    ```bash
-   keybase chat list --topic-type chat <keybase_team> 2>&1
+   echo '{"method":"listconvsonname","params":{"options":{"name":"<keybase_team>","members_type":"team","topic_type":"chat"}}}' | keybase chat api
    ```
 
-2. **Verify #info and #alerts channels exist** in the output.
+2. **Verify #info and #alerts channels exist** in `result.conversations[]` (check each conversation's `channel.topic_name`).
 
 3. **If channels are not accessible**, log a warning but do NOT abort:
    ```
@@ -254,15 +254,19 @@ If `keybase_notify` is enabled, verify that the configured team channels are acc
 
 If `listen_for_push` is enabled, check the #info channel for recent push messages from other instances before proceeding with the normal scheduled sync.
 
-1. **Read recent messages from #info**:
+1. **Read recent message history from #info** (Step A):
    ```bash
-   keybase chat read --channel info <keybase_team> --since "1h" 2>&1
+   echo '{"method":"read","params":{"options":{"channel":{"name":"<keybase_team>","topic_name":"info","members_type":"team"},"pagination":{"num":20}}}}' | keybase chat api
    ```
+   Parse `result.messages[]` for push notifications matching `config-sync (<hostname>): pushed` where `<hostname>` does NOT match our own hostname (compare against `$(hostname)`). Check `msg.sent_at_ms` to filter to the last hour only.
 
-2. **Parse for push notifications** from OTHER instances:
-   Look for messages matching the pattern `config-sync (<hostname>): pushed` where `<hostname>` does NOT match our own hostname (compare against `$(hostname)`).
+2. **Briefly listen for real-time notifications** (Step B):
+   ```bash
+   timeout 5 keybase chat api-listen 2>/dev/null || true
+   ```
+   Parse JSON lines from stdout for matching push notifications from other hostnames.
 
-3. **If a push notification from another instance is found**:
+3. **If a push notification from another instance is found** (in either Step A or Step B):
    - Set `triggered_by_push = true`
    - Log it:
      ```
@@ -342,7 +346,7 @@ If `listen_for_push` is enabled, check the #info channel for recent push message
 3. **If merge succeeds cleanly**:
    - If `keybase_notify` is enabled, post to #info:
      ```bash
-     keybase chat send --channel info <keybase_team> "config-sync ($(hostname)): pulled N commits from upstream. $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+     printf '{"method":"send","params":{"options":{"channel":{"name":"%s","topic_name":"info","members_type":"team"},"message":{"body":"%s"}}}}' "<keybase_team>" "config-sync ($(hostname)): pulled N commits from upstream. $(date -u +%Y-%m-%dT%H:%M:%SZ)" | keybase chat api
      ```
    - Proceed to Phase 6.
 
@@ -435,7 +439,7 @@ Only if `auto_push` is enabled (default: true).
    ```
    - If `keybase_notify` is enabled, post to #info:
      ```bash
-     keybase chat send --channel info <keybase_team> "config-sync ($(hostname)): pushed N commits to <branch>. $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+     printf '{"method":"send","params":{"options":{"channel":{"name":"%s","topic_name":"info","members_type":"team"},"message":{"body":"%s"}}}}' "<keybase_team>" "config-sync ($(hostname)): pushed N commits to <branch>. $(date -u +%Y-%m-%dT%H:%M:%SZ)" | keybase chat api
      ```
 
 ---
@@ -488,7 +492,7 @@ event_publish "config_sync_error" { error: "<type>", message: "<message>", times
 
 If `keybase_notify` is enabled, also post to #alerts with @drzow mention:
 ```bash
-keybase chat send --channel alerts <keybase_team> "@drzow config-sync ($(hostname)) ERROR: <type>: <message>. $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf '{"method":"send","params":{"options":{"channel":{"name":"%s","topic_name":"alerts","members_type":"team"},"message":{"body":"%s"}}}}' "<keybase_team>" "@drzow config-sync ($(hostname)) ERROR: <type>: <message>. $(date -u +%Y-%m-%dT%H:%M:%SZ)" | keybase chat api
 ```
 """
 

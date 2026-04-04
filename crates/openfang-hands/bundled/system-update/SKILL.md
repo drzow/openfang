@@ -226,22 +226,25 @@ The `-y` flag auto-confirms prompts. Updating conda first ensures the package so
 
 ### Sending Messages
 
+Use the `keybase chat api` JSON pipe interface for reliable, scriptable message delivery:
+
 ```bash
-keybase chat send --channel <channel> <team> "<message>"
+printf '{"method":"send","params":{"options":{"channel":{"name":"%s","topic_name":"%s","members_type":"team"},"message":{"body":"%s"}}}}' "<team>" "<channel>" "<message>" | keybase chat api
 ```
 
-Parameters:
-- `--channel` — the channel within the team (e.g. `info`, `alerts`)
-- Team name immediately follows (e.g. `drzowbot`)
-- Message is the final argument, quoted
+Parameters (in the JSON payload):
+- `name` — the team name (e.g. `drzowbot`)
+- `topic_name` — the channel within the team (e.g. `info`, `alerts`)
+- `members_type` — always `"team"` for team channels
+- `body` — the message text
 
 Examples:
 ```bash
 # Success summary to #info
-keybase chat send --channel info drzowbot "System Update Hand: update complete. 12 packages upgraded. All tools current."
+printf '{"method":"send","params":{"options":{"channel":{"name":"%s","topic_name":"%s","members_type":"team"},"message":{"body":"%s"}}}}' "drzowbot" "info" "System Update Hand: update complete. 12 packages upgraded. All tools current." | keybase chat api
 
 # Alert with mention to #alerts
-keybase chat send --channel alerts drzowbot "@drzow System Update Hand: sudo requires a password — updates cannot run."
+printf '{"method":"send","params":{"options":{"channel":{"name":"%s","topic_name":"%s","members_type":"team"},"message":{"body":"%s"}}}}' "drzowbot" "alerts" "@drzow System Update Hand: sudo requires a password — updates cannot run." | keybase chat api
 ```
 
 ### Verifying Team Membership
@@ -254,7 +257,7 @@ Check that the configured team appears in the output. If not, Keybase notificati
 
 ### Checking Channel Existence
 
-Keybase does not have a direct "list channels" CLI command. If `keybase chat send` to a channel fails with "channel not found", log the error. The team admin needs to create the channel.
+Keybase does not have a direct "list channels" CLI command. If `keybase chat api` returns an error with "channel not found", log the error. The team admin needs to create the channel.
 
 ### Verifying Keybase Status
 

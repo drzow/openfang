@@ -242,7 +242,7 @@ Before any system operations, verify that sudo is available without a password p
    - Log to memory: `memory_store "system_update_last_error" "sudo_password_required: <timestamp>"`
    - Post alert to Keybase (if available):
      ```bash
-     keybase chat send --channel alerts drzowbot "@drzow System Update Hand: sudo requires a password — cannot perform system updates. Please configure passwordless sudo for this account."
+     printf '{"method":"send","params":{"options":{"channel":{"name":"%s","topic_name":"%s","members_type":"team"},"message":{"body":"%s"}}}}' "drzowbot" "alerts" "@drzow System Update Hand: sudo requires a password — cannot perform system updates. Please configure passwordless sudo for this account." | keybase chat api
      ```
    - `event_publish "system_update_error" { error: "sudo_password_required", message: "sudo -n true failed — passwordless sudo not configured", timestamp: "..." }`
    - **STOP.** Do not proceed with any update operations.
@@ -404,13 +404,13 @@ Only if `keybase_available` is true. Use the configured `keybase_team` (default:
 
 ### Success — post to #info channel:
 ```bash
-keybase chat send --channel info <keybase_team> "System Update Hand: update complete. Packages upgraded: N. Tools updated: M. Held packages: <list or 'none'>. Time: <ISO timestamp>"
+printf '{"method":"send","params":{"options":{"channel":{"name":"%s","topic_name":"%s","members_type":"team"},"message":{"body":"%s"}}}}' "<keybase_team>" "info" "System Update Hand: update complete. Packages upgraded: N. Tools updated: M. Held packages: <list or 'none'>. Time: <ISO timestamp>" | keybase chat api
 ```
 
 ### Problems — post to #alerts channel:
 If any errors occurred during the run (lock contention, network failures, partial upgrades, tool failures):
 ```bash
-keybase chat send --channel alerts <keybase_team> "@drzow System Update Hand: issues during update run. <summary of problems>. Time: <ISO timestamp>"
+printf '{"method":"send","params":{"options":{"channel":{"name":"%s","topic_name":"%s","members_type":"team"},"message":{"body":"%s"}}}}' "<keybase_team>" "alerts" "@drzow System Update Hand: issues during update run. <summary of problems>. Time: <ISO timestamp>" | keybase chat api
 ```
 
 ### Both channels if mixed results:
@@ -473,7 +473,7 @@ event_publish "system_update_error" { error: "<type>", message: "<message>", tim
 
 If Keybase is available, critical errors also go to #alerts:
 ```bash
-keybase chat send --channel alerts <keybase_team> "@drzow System Update Hand: <error summary>"
+printf '{"method":"send","params":{"options":{"channel":{"name":"%s","topic_name":"%s","members_type":"team"},"message":{"body":"%s"}}}}' "<keybase_team>" "alerts" "@drzow System Update Hand: <error summary>" | keybase chat api
 ```
 """
 

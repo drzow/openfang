@@ -174,7 +174,7 @@ Run this every time you are activated (scheduled or on-demand).
    - Remove the lock file: `rm -f "$HOME/.openfang/self-update.lock"`
    - Post success to Keybase #info:
      ```bash
-     keybase chat send --channel info <keybase_team> "self-update ($(hostname)): restart confirmed — new daemon is running successfully. $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+     printf '{"method":"send","params":{"options":{"channel":{"name":"%s","topic_name":"%s","members_type":"team"},"message":{"body":"%s"}}}}' "<keybase_team>" "info" "self-update ($(hostname)): restart confirmed — new daemon is running successfully. $(date -u +%Y-%m-%dT%H:%M:%SZ)" | keybase chat api
      ```
    - Skip to Phase 7 (metrics update).
 
@@ -235,7 +235,7 @@ If no schedule for this hand exists:
    - **Hard abort.** Never stash, never auto-commit.
    - Post to Keybase #alerts:
      ```bash
-     keybase chat send --channel alerts <keybase_team> "@drzow self-update ($(hostname)) ABORTED: working tree is dirty — uncommitted changes detected. Please commit or discard changes before self-update can proceed. $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+     printf '{"method":"send","params":{"options":{"channel":{"name":"%s","topic_name":"%s","members_type":"team"},"message":{"body":"%s"}}}}' "<keybase_team>" "alerts" "@drzow self-update ($(hostname)) ABORTED: working tree is dirty — uncommitted changes detected. Please commit or discard changes before self-update can proceed. $(date -u +%Y-%m-%dT%H:%M:%SZ)" | keybase chat api
      ```
    - `memory_store "self_update_last_error" "dirty_working_tree: <timestamp>"`
    - `event_publish "self_update_error" { error: "dirty_working_tree", timestamp: "..." }`
@@ -299,7 +299,7 @@ If no schedule for this hand exists:
    - Log error: `memory_store "self_update_last_error" "merge_not_ff: branches diverged at <timestamp>"`
    - Post to #alerts:
      ```bash
-     keybase chat send --channel alerts <keybase_team> "@drzow self-update ($(hostname)) ABORTED: cannot fast-forward merge — branches have diverged. Manual intervention required. $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+     printf '{"method":"send","params":{"options":{"channel":{"name":"%s","topic_name":"%s","members_type":"team"},"message":{"body":"%s"}}}}' "<keybase_team>" "alerts" "@drzow self-update ($(hostname)) ABORTED: cannot fast-forward merge — branches have diverged. Manual intervention required. $(date -u +%Y-%m-%dT%H:%M:%SZ)" | keybase chat api
      ```
    - `event_publish "self_update_error" { error: "merge_not_ff", timestamp: "..." }`
    - **STOP.** Do not force-merge.
@@ -327,7 +327,7 @@ If no schedule for this hand exists:
    ```
    - Post to #alerts:
      ```bash
-     keybase chat send --channel alerts <keybase_team> "@drzow self-update ($(hostname)) BUILD FAILED: rolled back to <ROLLBACK_COMMIT>. Check build logs. $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+     printf '{"method":"send","params":{"options":{"channel":{"name":"%s","topic_name":"%s","members_type":"team"},"message":{"body":"%s"}}}}' "<keybase_team>" "alerts" "@drzow self-update ($(hostname)) BUILD FAILED: rolled back to <ROLLBACK_COMMIT>. Check build logs. $(date -u +%Y-%m-%dT%H:%M:%SZ)" | keybase chat api
      ```
    - `memory_store "self_update_last_error" "build_failed: rolled back to <ROLLBACK_COMMIT> at <timestamp>"`
    - `event_publish "self_update_error" { error: "build_failed", rollback_commit: "<ROLLBACK_COMMIT>", timestamp: "..." }`
@@ -398,7 +398,7 @@ If no schedule for this hand exists:
    3. Poll for `$HOME/.openfang/daemon.json` existence for up to 90 seconds (check every 5 seconds).
    4. On success (daemon.json appears): post to Keybase #info channel:
       ```bash
-      keybase chat send --channel info "$KEYBASE_TEAM" "self-update ($(hostname)): daemon restarted successfully with new build. $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      printf '{"method":"send","params":{"options":{"channel":{"name":"%s","topic_name":"%s","members_type":"team"},"message":{"body":"%s"}}}}' "$KEYBASE_TEAM" "info" "self-update ($(hostname)): daemon restarted successfully with new build. $(date -u +%Y-%m-%dT%H:%M:%SZ)" | keybase chat api
       ```
    5. On failure (daemon.json does not appear within 90 seconds):
       - Kill the new daemon process if it exists.
@@ -406,7 +406,7 @@ If no schedule for this hand exists:
       - Clean and rebuild the old version: `cargo clean -p openfang-cli -p openfang-desktop && cd "$REPO_DIR" && cargo build --profile "$BUILD_PROFILE" -p openfang-cli -p openfang-desktop`
       - Copy the rebuilt old binary back: `cp "$REPO_DIR/target/$BUILD_PROFILE/openfang" "$BINARY_PATH"`
       - Restart the old version: `nohup "$BINARY_PATH" start > "$HOME/.openfang/daemon.stdout.log" 2>&1 &`
-      - Post to Keybase #alerts: `"@drzow self-update ($(hostname)) RESTART FAILED: rolled back to $ROLLBACK_COMMIT and restarted old version."`
+      - Post to Keybase #alerts: `printf '{"method":"send","params":{"options":{"channel":{"name":"%s","topic_name":"%s","members_type":"team"},"message":{"body":"%s"}}}}' "$KEYBASE_TEAM" "alerts" "@drzow self-update ($(hostname)) RESTART FAILED: rolled back to $ROLLBACK_COMMIT and restarted old version. $(date -u +%Y-%m-%dT%H:%M:%SZ)" | keybase chat api`
    6. Lock file cleanup via `trap ... EXIT` — always remove `$HOME/.openfang/self-update.lock` on script exit.
 
 9. **Set permissions**:
@@ -426,7 +426,7 @@ If no schedule for this hand exists:
 
 12. **Post to #info**: "self-update: update initiated, daemon will restart shortly"
     ```bash
-    keybase chat send --channel info <keybase_team> "self-update ($(hostname)): update initiated — daemon will restart shortly. $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '{"method":"send","params":{"options":{"channel":{"name":"%s","topic_name":"%s","members_type":"team"},"message":{"body":"%s"}}}}' "<keybase_team>" "info" "self-update ($(hostname)): update initiated — daemon will restart shortly. $(date -u +%Y-%m-%dT%H:%M:%SZ)" | keybase chat api
     ```
 
 13. **Launch the restart script**:
@@ -444,7 +444,7 @@ This phase runs only when `auto_restart` is disabled or when no updates were fou
 
 - **Build ready but no restart**: Post to #info:
   ```bash
-  keybase chat send --channel info <keybase_team> "self-update ($(hostname)): new build ready at <BUILT_BINARY>. Manual restart required. $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '{"method":"send","params":{"options":{"channel":{"name":"%s","topic_name":"%s","members_type":"team"},"message":{"body":"%s"}}}}' "<keybase_team>" "info" "self-update ($(hostname)): new build ready at <BUILT_BINARY>. Manual restart required. $(date -u +%Y-%m-%dT%H:%M:%SZ)" | keybase chat api
   ```
 
 - **No updates found**: Silent — no notification needed. Brief log to memory is sufficient.
@@ -503,7 +503,7 @@ event_publish "self_update_error" { error: "<type>", message: "<message>", times
 
 All critical errors must also go to Keybase #alerts with @drzow mention:
 ```bash
-keybase chat send --channel alerts <keybase_team> "@drzow self-update ($(hostname)) ERROR: <type>: <message>. $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf '{"method":"send","params":{"options":{"channel":{"name":"%s","topic_name":"%s","members_type":"team"},"message":{"body":"%s"}}}}' "<keybase_team>" "alerts" "@drzow self-update ($(hostname)) ERROR: <type>: <message>. $(date -u +%Y-%m-%dT%H:%M:%SZ)" | keybase chat api
 ```
 """
 
