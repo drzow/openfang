@@ -41,6 +41,7 @@ function agentsPage() {
 
     // -- Multi-step wizard state --
     spawnProviders: [],       // populated from /api/providers on wizard open
+    spawnModels: [],          // populated from /api/models (available only) on wizard open
     spawnProvidersLoading: false,
     spawnStep: 1,
     spawnIdentity: { emoji: '', color: '#FF5C00', archetype: '' },
@@ -408,20 +409,24 @@ function agentsPage() {
       this.spawnForm.model = 'default';
       this.spawnForm.systemPrompt = 'You are a helpful assistant.';
       this.spawnForm.profile = 'full';
-      // Fetch status defaults and dynamic provider list concurrently
+      // Fetch status defaults, dynamic provider list, and available models concurrently
       this.spawnProvidersLoading = true;
       try {
         var results = await Promise.all([
           OpenFangAPI.get('/api/status').catch(function() { return {}; }),
-          OpenFangAPI.get('/api/providers').catch(function() { return { providers: [] }; })
+          OpenFangAPI.get('/api/providers').catch(function() { return { providers: [] }; }),
+          OpenFangAPI.get('/api/models').catch(function() { return { models: [] }; })
         ]);
         var status = results[0];
         var provData = results[1];
+        var modelData = results[2];
         if (status.default_provider) this.spawnForm.provider = status.default_provider;
         if (status.default_model) this.spawnForm.model = status.default_model;
         this.spawnProviders = provData.providers || [];
+        this.spawnModels = (modelData.models || []).filter(function(m) { return m.available; });
       } catch(e) {
         this.spawnProviders = [];
+        this.spawnModels = [];
       }
       this.spawnProvidersLoading = false;
     },
@@ -436,6 +441,12 @@ function agentsPage() {
 
     prevStep() {
       if (this.spawnStep > 1) this.spawnStep--;
+    },
+
+    get spawnModelsForProvider() {
+      var provider = this.spawnForm.provider;
+      if (!provider) return this.spawnModels;
+      return this.spawnModels.filter(function(m) { return m.provider === provider; });
     },
 
     selectPreset(preset) {

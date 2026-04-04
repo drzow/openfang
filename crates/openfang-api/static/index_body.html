@@ -1175,7 +1175,16 @@
                     </div>
                     <div class="form-group">
                       <label>Model</label>
-                      <input class="form-input" x-model="spawnForm.model" placeholder="e.g. llama-3.3-70b-versatile">
+                      <template x-if="spawnModelsForProvider.length > 0">
+                        <select class="form-select" x-model="spawnForm.model">
+                          <template x-for="m in spawnModelsForProvider" :key="m.id">
+                            <option :value="m.id" x-text="m.display_name || m.id"></option>
+                          </template>
+                        </select>
+                      </template>
+                      <template x-if="spawnModelsForProvider.length === 0">
+                        <input class="form-input" x-model="spawnForm.model" placeholder="e.g. llama-3.3-70b-versatile">
+                      </template>
                     </div>
                     <div class="form-group">
                       <label>System Prompt</label>
@@ -3367,6 +3376,11 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                   <option :value="t" x-text="t"></option>
                 </template>
               </select>
+              <select class="form-select" style="width:140px" x-model="modelAvailFilter">
+                <option value="available">Available</option>
+                <option value="">All Models</option>
+                <option value="unavailable">Unavailable</option>
+              </select>
               <button class="btn btn-primary btn-sm" @click="showCustomModelForm = !showCustomModelForm" x-text="showCustomModelForm ? 'Cancel' : '+ Custom Model'"></button>
             </div>
             <!-- Custom model form -->
@@ -3398,14 +3412,14 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
               <div style="font-size:32px;margin-bottom:8px;opacity:0.5">&#x1F916;</div>
               <h3 style="margin:0 0 4px;font-size:14px" x-text="models.length ? 'No models match your search' : 'No models available'"></h3>
               <p class="text-xs text-dim" x-text="models.length ? 'Try a different search term or clear filters.' : 'Configure an LLM provider to see available models.'"></p>
-              <button class="btn btn-ghost btn-sm mt-2" x-show="models.length && (modelSearch || modelProviderFilter)" @click="modelSearch=''; modelProviderFilter=''">Clear Filters</button>
+              <button class="btn btn-ghost btn-sm mt-2" x-show="models.length && (modelSearch || modelProviderFilter || modelAvailFilter)" @click="modelSearch=''; modelProviderFilter=''; modelAvailFilter=''">Clear Filters</button>
             </div>
             <div class="table-wrap" x-show="filteredModels.length">
               <table>
                 <thead><tr><th>Model</th><th>Provider</th><th>Tier</th><th>Context</th><th>Input Cost</th><th>Output Cost</th><th>Status</th><th></th></tr></thead>
                 <tbody>
                   <template x-for="m in filteredModels" :key="m.id">
-                    <tr>
+                    <tr :style="!m.available ? 'opacity:0.5' : ''">
                       <td style="font-size:11px"><div class="font-bold" x-text="m.display_name || m.id"></div><div class="text-xs text-dim" style="font-family:var(--font-mono);opacity:0.7;user-select:all" x-show="m.display_name && m.display_name !== m.id" x-text="m.id"></div></td>
                       <td class="text-dim" x-text="m.provider"></td>
                       <td><span class="tier-badge" :class="tierBadgeClass(m.tier)" x-text="m.tier || '-'"></span></td>

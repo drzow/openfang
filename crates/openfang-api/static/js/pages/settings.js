@@ -14,6 +14,7 @@ function settingsPage() {
     modelSearch: '',
     modelProviderFilter: '',
     modelTierFilter: '',
+    modelAvailFilter: 'available',
     showCustomModelForm: false,
     customModelId: '',
     customModelProvider: 'openrouter',
@@ -321,6 +322,8 @@ function settingsPage() {
     get filteredModels() {
       var self = this;
       return this.models.filter(function(m) {
+        if (self.modelAvailFilter === 'available' && !m.available) return false;
+        if (self.modelAvailFilter === 'unavailable' && m.available) return false;
         if (self.modelProviderFilter && m.provider !== self.modelProviderFilter) return false;
         if (self.modelTierFilter && m.tier !== self.modelTierFilter) return false;
         if (self.modelSearch) {
