@@ -7026,7 +7026,7 @@ pub async fn compact_session(
             )
         }
     };
-    match state.kernel.compact_agent_session(agent_id).await {
+    match state.kernel.compact_agent_session_force(agent_id).await {
         Ok(msg) => (
             StatusCode::OK,
             Json(serde_json::json!({"status": "ok", "message": msg})),

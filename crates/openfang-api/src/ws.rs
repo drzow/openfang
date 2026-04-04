@@ -844,7 +844,7 @@ async fn handle_command(
             }
             Err(e) => serde_json::json!({"type": "error", "content": format!("Reset failed: {e}")}),
         },
-        "compact" => match state.kernel.compact_agent_session(agent_id).await {
+        "compact" => match state.kernel.compact_agent_session_force(agent_id).await {
             Ok(msg) => {
                 serde_json::json!({"type": "command_result", "command": cmd, "message": msg})
             }

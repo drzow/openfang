@@ -691,7 +691,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
 
     async fn compact_session(&self, agent_id: AgentId) -> Result<String, String> {
         self.kernel
-            .compact_agent_session(agent_id)
+            .compact_agent_session_force(agent_id)
             .await
             .map_err(|e| format!("{e}"))
     }
@@ -1794,7 +1794,12 @@ pub async fn start_channel_bridge_with_config(
             Err(e) => {
                 // Remove from kernel map if start failed
                 kernel.channel_adapters.remove(&name);
-                error!("Failed to start {name} bridge: {e}");
+                let msg = e.to_string();
+                if msg.contains("OAuth") || msg.contains("401") || msg.contains("400 Bad Request") {
+                    warn!("{name} adapter disabled — check credentials ({msg})");
+                } else {
+                    error!("Failed to start {name} bridge: {e}");
+                }
             }
         }
     }

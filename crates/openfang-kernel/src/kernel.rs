@@ -1832,7 +1832,12 @@ impl OpenFangKernel {
                 estimate_token_count, needs_compaction as check_compact,
                 needs_compaction_by_tokens, CompactionConfig,
             };
-            let config = CompactionConfig::default();
+            let mut config = CompactionConfig::default();
+            if let Ok(cat) = self.model_catalog.read() {
+                if let Some(model) = cat.find_model(&entry.manifest.model.model) {
+                    config.context_window_tokens = model.context_window as usize;
+                }
+            }
             let by_messages = check_compact(&session, &config);
             let estimated = estimate_token_count(
                 &session.messages,
@@ -1845,6 +1850,7 @@ impl OpenFangKernel {
                     agent_id = %agent_id,
                     estimated_tokens = estimated,
                     messages = session.messages.len(),
+                    context_window = config.context_window_tokens,
                     "Token-based compaction triggered (messages below threshold but tokens above)"
                 );
             }
@@ -2185,7 +2191,12 @@ impl OpenFangKernel {
                         use openfang_runtime::compactor::{
                             estimate_token_count, needs_compaction_by_tokens, CompactionConfig,
                         };
-                        let config = CompactionConfig::default();
+                        let mut config = CompactionConfig::default();
+                        if let Ok(cat) = kernel_clone.model_catalog.read() {
+                            if let Some(model) = cat.find_model(&entry.manifest.model.model) {
+                                config.context_window_tokens = model.context_window as usize;
+                            }
+                        }
                         let estimated = estimate_token_count(&session.messages, None, None);
                         if needs_compaction_by_tokens(estimated, &config) {
                             let kc = kernel_clone.clone();
@@ -2395,7 +2406,12 @@ impl OpenFangKernel {
                 estimate_token_count, needs_compaction as check_compact,
                 needs_compaction_by_tokens, CompactionConfig,
             };
-            let config = CompactionConfig::default();
+            let mut config = CompactionConfig::default();
+            if let Ok(cat) = self.model_catalog.read() {
+                if let Some(model) = cat.find_model(&entry.manifest.model.model) {
+                    config.context_window_tokens = model.context_window as usize;
+                }
+            }
             let by_messages = check_compact(&session, &config);
             let estimated = estimate_token_count(
                 &session.messages,
@@ -3261,7 +3277,28 @@ impl OpenFangKernel {
     /// Replaces the existing text-truncation compaction with an intelligent
     /// LLM-generated summary of older messages, keeping only recent messages.
     pub async fn compact_agent_session(&self, agent_id: AgentId) -> KernelResult<String> {
-        use openfang_runtime::compactor::{compact_session, needs_compaction, CompactionConfig};
+        self.compact_agent_session_inner(agent_id, false).await
+    }
+
+    /// Compact an agent's session, optionally forcing compaction even when
+    /// message count and token count are below threshold. User-initiated
+    /// `/compact` calls should pass `force: true`.
+    pub async fn compact_agent_session_force(
+        &self,
+        agent_id: AgentId,
+    ) -> KernelResult<String> {
+        self.compact_agent_session_inner(agent_id, true).await
+    }
+
+    async fn compact_agent_session_inner(
+        &self,
+        agent_id: AgentId,
+        force: bool,
+    ) -> KernelResult<String> {
+        use openfang_runtime::compactor::{
+            compact_session, estimate_token_count, needs_compaction, needs_compaction_by_tokens,
+            CompactionConfig,
+        };
 
         let entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::OpenFang(OpenFangError::AgentNotFound(agent_id.to_string()))
@@ -3279,14 +3316,25 @@ impl OpenFangKernel {
                 label: None,
             });
 
-        let config = CompactionConfig::default();
+        let mut config = CompactionConfig::default();
+        // Use the model's actual context window from the catalog
+        if let Ok(cat) = self.model_catalog.read() {
+            if let Some(model) = cat.find_model(&entry.manifest.model.model) {
+                config.context_window_tokens = model.context_window as usize;
+            }
+        }
 
-        if !needs_compaction(&session, &config) {
-            return Ok(format!(
-                "No compaction needed ({} messages, threshold {})",
-                session.messages.len(),
-                config.threshold
-            ));
+        if !force {
+            let by_messages = needs_compaction(&session, &config);
+            let estimated = estimate_token_count(&session.messages, None, None);
+            let by_tokens = needs_compaction_by_tokens(estimated, &config);
+            if !by_messages && !by_tokens {
+                return Ok(format!(
+                    "No compaction needed ({} messages, threshold {})",
+                    session.messages.len(),
+                    config.threshold
+                ));
+            }
         }
 
         let driver = self.resolve_driver(&entry.manifest)?;
