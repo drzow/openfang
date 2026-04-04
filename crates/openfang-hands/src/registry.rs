@@ -751,7 +751,7 @@ mod tests {
     fn load_bundled_hands() {
         let reg = HandRegistry::new();
         let count = reg.load_bundled();
-        assert_eq!(count, 11);
+        assert_eq!(count, 12);
         assert!(!reg.list_definitions().is_empty());
 
         // Clip hand should be loaded
@@ -772,6 +772,9 @@ mod tests {
 
         // System update hand should be loaded
         assert!(reg.get_definition("system-update").is_some());
+
+        // Self-update hand should be loaded
+        assert!(reg.get_definition("self-update").is_some());
     }
 
     #[test]

@@ -60,6 +60,11 @@ pub fn bundled_hands() -> Vec<(&'static str, &'static str, &'static str)> {
             include_str!("../bundled/system-update/HAND.toml"),
             include_str!("../bundled/system-update/SKILL.md"),
         ),
+        (
+            "self-update",
+            include_str!("../bundled/self-update/HAND.toml"),
+            include_str!("../bundled/self-update/SKILL.md"),
+        ),
     ]
 }
 
@@ -91,7 +96,7 @@ mod tests {
     #[test]
     fn bundled_hands_count() {
         let hands = bundled_hands();
-        assert_eq!(hands.len(), 11);
+        assert_eq!(hands.len(), 12);
     }
 
     #[test]
@@ -265,6 +270,7 @@ mod tests {
             "trader",
             "config-sync",
             "system-update",
+            "self-update",
         ];
         for (id, toml_content, skill_content) in bundled_hands() {
             if einstein_ids.contains(&id) {
@@ -299,6 +305,7 @@ mod tests {
             "trader",
             "config-sync",
             "system-update",
+            "self-update",
         ];
         for (id, toml_content, skill_content) in bundled_hands() {
             if einstein_ids.contains(&id) {
@@ -547,6 +554,88 @@ mod tests {
     }
 
     #[test]
+    fn parse_self_update_hand() {
+        let (id, toml_content, skill_content) = bundled_hands()
+            .into_iter()
+            .find(|(id, _, _)| *id == "self-update")
+            .expect("self-update hand must be in bundled_hands()");
+        let def = parse_bundled(id, toml_content, skill_content).unwrap();
+        assert_eq!(def.id, "self-update");
+        assert_eq!(def.name, "Self-Update Hand");
+        assert_eq!(def.category, crate::HandCategory::Productivity);
+        assert!(def.skill_content.is_some());
+        // Required binaries
+        assert!(!def.requires.is_empty());
+        let req_keys: Vec<&str> = def.requires.iter().map(|r| r.key.as_str()).collect();
+        assert!(req_keys.contains(&"git"), "must require git");
+        assert!(req_keys.contains(&"cargo"), "must require cargo");
+        assert!(req_keys.contains(&"keybase"), "must require keybase");
+        // Einstein scheduling tools
+        assert!(def.tools.contains(&"schedule_create".to_string()));
+        assert!(def.tools.contains(&"schedule_list".to_string()));
+        assert!(def.tools.contains(&"schedule_delete".to_string()));
+        // Memory tools
+        assert!(def.tools.contains(&"memory_store".to_string()));
+        assert!(def.tools.contains(&"memory_recall".to_string()));
+        // Knowledge graph tools
+        assert!(def.tools.contains(&"knowledge_add_entity".to_string()));
+        assert!(def.tools.contains(&"knowledge_add_relation".to_string()));
+        assert!(def.tools.contains(&"knowledge_query".to_string()));
+        // Event bus
+        assert!(def.tools.contains(&"event_publish".to_string()));
+        // Shell and file access
+        assert!(def.tools.contains(&"shell_exec".to_string()));
+        assert!(def.tools.contains(&"file_write".to_string()));
+        // Settings
+        assert!(!def.settings.is_empty());
+        let setting_keys: Vec<&str> = def.settings.iter().map(|s| s.key.as_str()).collect();
+        assert!(
+            setting_keys.contains(&"upstream_url"),
+            "must have upstream_url setting"
+        );
+        assert!(
+            setting_keys.contains(&"upstream_branch"),
+            "must have upstream_branch setting"
+        );
+        assert!(
+            setting_keys.contains(&"build_profile"),
+            "must have build_profile setting"
+        );
+        assert!(
+            setting_keys.contains(&"auto_restart"),
+            "must have auto_restart setting"
+        );
+        assert!(
+            setting_keys.contains(&"update_schedule"),
+            "must have update_schedule setting"
+        );
+        assert!(
+            setting_keys.contains(&"keybase_team"),
+            "must have keybase_team setting"
+        );
+        // Dashboard
+        assert!(!def.dashboard.metrics.is_empty());
+        let metric_keys: Vec<&str> = def
+            .dashboard
+            .metrics
+            .iter()
+            .map(|m| m.memory_key.as_str())
+            .collect();
+        assert!(metric_keys.contains(&"self_update_total_updates"));
+        assert!(metric_keys.contains(&"self_update_last_update"));
+        assert!(metric_keys.contains(&"self_update_last_error"));
+        assert!(metric_keys.contains(&"self_update_current_version"));
+        assert!(metric_keys.contains(&"self_update_commits_behind"));
+        assert!(metric_keys.contains(&"self_update_last_build_duration"));
+        // Agent config
+        assert!(!def.agent.system_prompt.is_empty());
+        assert!(
+            def.agent.temperature < 0.2,
+            "ops hand should use low temperature"
+        );
+    }
+
+    #[test]
     fn all_einstein_hands_have_knowledge_graph() {
         let einstein_ids = [
             "lead",
@@ -557,6 +646,7 @@ mod tests {
             "trader",
             "config-sync",
             "system-update",
+            "self-update",
         ];
         for (id, toml_content, skill_content) in bundled_hands() {
             if einstein_ids.contains(&id) {
