@@ -131,106 +131,176 @@ pub async fn probe_provider(provider: &str, base_url: &str) -> ProbeResult {
     };
 
     let lower = provider.to_lowercase();
+    let root = base_url
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .trim_end_matches("/v1/");
+    let trimmed = base_url.trim_end_matches('/');
 
-    // Ollama uses a non-OpenAI endpoint for model listing
-    let (url, is_ollama) = if lower == "ollama" {
-        // base_url is typically "http://localhost:11434/v1" — strip /v1 for the ps endpoint
-        let root = base_url
-            .trim_end_matches('/')
-            .trim_end_matches("/v1")
-            .trim_end_matches("/v1/");
-        // Use /api/ps to list only currently running/loaded models
-        (format!("{root}/api/ps"), true)
-    } else {
-        // OpenAI-compatible: GET {base_url}/models
-        let trimmed = base_url.trim_end_matches('/');
-        (format!("{trimmed}/models"), false)
-    };
+    // ── Step 1: Discover models ─────────────────────────────────────────────
+    // For Ollama-configured providers, try endpoints in order of preference:
+    //   1. /api/ps   (Ollama proper — only running models)
+    //   2. /api/tags (Ollama-compat / llama.cpp — all loaded models)
+    //   3. /v1/models (OpenAI-compat — universal fallback)
+    // For non-Ollama providers, go straight to /v1/models.
 
-    let resp = match client.get(&url).send().await {
-        Ok(r) => r,
-        Err(e) => {
+    let body: serde_json::Value;
+    let mut used_openai_compat = false;
+
+    if lower == "ollama" {
+        // Try /api/ps first (running models only)
+        let ps_url = format!("{root}/api/ps");
+        let ps_result = client.get(&ps_url).send().await;
+        if let Ok(resp) = ps_result {
+            if resp.status().is_success() {
+                if let Ok(v) = resp.json::<serde_json::Value>().await {
+                    body = v;
+                } else {
+                    body = serde_json::Value::Null;
+                }
+            } else {
+                // /api/ps failed (e.g. 404 on llama.cpp) — try /api/tags
+                let tags_url = format!("{root}/api/tags");
+                if let Ok(resp2) = client.get(&tags_url).send().await {
+                    if resp2.status().is_success() {
+                        body = resp2.json().await.unwrap_or(serde_json::Value::Null);
+                    } else {
+                        // Fall back to OpenAI-compat /v1/models
+                        let models_url = format!("{trimmed}/models");
+                        match client.get(&models_url).send().await {
+                            Ok(r) if r.status().is_success() => {
+                                used_openai_compat = true;
+                                body = r.json().await.unwrap_or(serde_json::Value::Null);
+                            }
+                            _ => {
+                                return ProbeResult {
+                                    latency_ms: start.elapsed().as_millis() as u64,
+                                    error: Some("All Ollama endpoints failed".into()),
+                                    ..Default::default()
+                                };
+                            }
+                        }
+                    }
+                } else {
+                    body = serde_json::Value::Null;
+                }
+            }
+        } else {
             return ProbeResult {
                 latency_ms: start.elapsed().as_millis() as u64,
-                error: Some(format!("{e}")),
+                error: Some(format!("{}", ps_result.unwrap_err())),
                 ..Default::default()
             };
         }
-    };
+    } else {
+        // Non-Ollama: GET {base_url}/models
+        let models_url = format!("{trimmed}/models");
+        match client.get(&models_url).send().await {
+            Ok(r) if r.status().is_success() => {
+                used_openai_compat = true;
+                body = r.json().await.unwrap_or(serde_json::Value::Null);
+            }
+            Ok(r) => {
+                return ProbeResult {
+                    latency_ms: start.elapsed().as_millis() as u64,
+                    error: Some(format!("HTTP {}", r.status())),
+                    ..Default::default()
+                };
+            }
+            Err(e) => {
+                return ProbeResult {
+                    latency_ms: start.elapsed().as_millis() as u64,
+                    error: Some(format!("{e}")),
+                    ..Default::default()
+                };
+            }
+        }
+    }
 
-    if !resp.status().is_success() {
+    if body.is_null() {
         return ProbeResult {
+            reachable: true,
             latency_ms: start.elapsed().as_millis() as u64,
-            error: Some(format!("HTTP {}", resp.status())),
+            error: Some("Server responded but returned invalid JSON".into()),
             ..Default::default()
         };
     }
 
-    let body: serde_json::Value = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            return ProbeResult {
-                reachable: true, // server responded, just bad JSON
-                latency_ms: start.elapsed().as_millis() as u64,
-                error: Some(format!("Invalid JSON: {e}")),
-                ..Default::default()
-            };
-        }
-    };
-
     let latency_ms = start.elapsed().as_millis() as u64;
 
-    // Parse model names
-    let model_names: Vec<String> = if is_ollama {
-        // Ollama /api/ps: { "models": [ { "name": "model:latest", ... }, ... ] }
-        body.get("models")
+    // ── Step 2: Parse model names and inline context metadata ───────────────
+
+    let models: Vec<DiscoveredModel> = if used_openai_compat {
+        // OpenAI-compatible: { "data": [ { "id": "model-name", "meta": { "n_ctx_train": N }, ... } ] }
+        body.get("data")
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
                     .filter_map(|m| {
-                        m.get("name")
-                            .and_then(|n| n.as_str())
-                            .map(|s| s.to_string())
+                        let id = m.get("id").and_then(|n| n.as_str())?.to_string();
+                        // llama.cpp includes meta.n_ctx_train in /v1/models
+                        let ctx_train = m
+                            .get("meta")
+                            .and_then(|meta| meta.get("n_ctx_train"))
+                            .and_then(|v| v.as_u64());
+                        Some(DiscoveredModel {
+                            id,
+                            context_window: ctx_train,
+                        })
                     })
                     .collect()
             })
             .unwrap_or_default()
     } else {
-        // OpenAI-compatible: { "data": [ { "id": "model-name", ... }, ... ] }
-        body.get("data")
+        // Ollama /api/ps or /api/tags: { "models": [ { "name": "model:latest", ... } ] }
+        body.get("models")
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|m| m.get("id").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                    .filter_map(|m| {
+                        let name = m.get("name").and_then(|n| n.as_str())?.to_string();
+                        Some(DiscoveredModel {
+                            id: name,
+                            context_window: None,
+                        })
+                    })
                     .collect()
             })
             .unwrap_or_default()
     };
 
-    // For Ollama, enrich each model with actual context window from /api/show
-    let models = if is_ollama {
-        let root = base_url
-            .trim_end_matches('/')
-            .trim_end_matches("/v1")
-            .trim_end_matches("/v1/");
-        let show_url = format!("{root}/api/show");
-        let mut enriched = Vec::with_capacity(model_names.len());
-        for name in &model_names {
-            let ctx = fetch_ollama_context_window(&client, &show_url, name).await;
-            enriched.push(DiscoveredModel {
-                id: name.clone(),
-                context_window: ctx,
-            });
+    // ── Step 3: Enrich with runtime context window ──────────────────────────
+    // Try /props (llama.cpp) for actual n_ctx, then /api/show (Ollama) per model.
+    let models = if lower == "ollama" {
+        let mut enriched = models;
+        // First try /props — llama.cpp exposes actual runtime n_ctx here
+        let props_ctx = fetch_props_n_ctx(&client, root).await;
+        if let Some(n_ctx) = props_ctx {
+            // /props returns the server-wide n_ctx — apply to all models
+            for m in &mut enriched {
+                if m.context_window.is_none() || m.context_window == Some(0) {
+                    m.context_window = Some(n_ctx);
+                }
+                // If we got n_ctx_train from /v1/models but /props has the real runtime value, prefer it
+                if let Some(train) = m.context_window {
+                    if train > n_ctx {
+                        m.context_window = Some(n_ctx);
+                    }
+                }
+            }
+        } else {
+            // Fall back to /api/show per model (Ollama proper)
+            let show_url = format!("{root}/api/show");
+            for m in &mut enriched {
+                if m.context_window.is_none() {
+                    m.context_window =
+                        fetch_ollama_context_window(&client, &show_url, &m.id).await;
+                }
+            }
         }
         enriched
     } else {
-        model_names
-            .into_iter()
-            .map(|id| DiscoveredModel {
-                id,
-                context_window: None,
-            })
-            .collect()
+        models
     };
 
     ProbeResult {
@@ -258,6 +328,23 @@ async fn fetch_ollama_context_window(
     }
     let json: serde_json::Value = resp.json().await.ok()?;
     parse_ollama_context_window(&json)
+}
+
+/// Query a llama.cpp server's `/props` endpoint for the runtime `n_ctx`.
+///
+/// llama.cpp exposes `default_generation_settings.n_ctx` which is the actual
+/// context window configured at server start (may be much smaller than
+/// the model's training context). Returns `None` if the endpoint is unavailable.
+async fn fetch_props_n_ctx(client: &reqwest::Client, root_url: &str) -> Option<u64> {
+    let url = format!("{root_url}/props");
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    json.get("default_generation_settings")
+        .and_then(|dgs| dgs.get("n_ctx"))
+        .and_then(|v| v.as_u64())
 }
 
 /// Parse the context window from an Ollama `/api/show` response.

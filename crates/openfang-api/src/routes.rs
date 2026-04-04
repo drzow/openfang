@@ -6101,11 +6101,23 @@ pub async fn list_models(
             true
         })
         .map(|m| {
-            // Custom models from unknown providers are assumed available
-            let available = catalog
-                .get_provider(&m.provider)
-                .map(|p| p.auth_status != openfang_types::model_catalog::AuthStatus::Missing)
-                .unwrap_or(m.tier == openfang_types::model_catalog::ModelTier::Custom);
+            // Determine availability:
+            // - For local providers (ollama, vllm, lmstudio): only discovered/running
+            //   models (Local tier) are available — builtin catalog entries are not.
+            // - For cloud providers: available if API key is configured.
+            // - Custom models from unknown providers are assumed available.
+            let available = if openfang_runtime::provider_health::is_local_provider(&m.provider)
+            {
+                m.tier == openfang_types::model_catalog::ModelTier::Local
+                    || m.tier == openfang_types::model_catalog::ModelTier::Custom
+            } else {
+                catalog
+                    .get_provider(&m.provider)
+                    .map(|p| {
+                        p.auth_status != openfang_types::model_catalog::AuthStatus::Missing
+                    })
+                    .unwrap_or(m.tier == openfang_types::model_catalog::ModelTier::Custom)
+            };
             serde_json::json!({
                 "id": m.id,
                 "display_name": m.display_name,
