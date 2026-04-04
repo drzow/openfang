@@ -1,6 +1,6 @@
 id = "config-sync"
 name = "Config Sync Hand"
-description = "Daily autonomous configuration repository synchronisation. Ensures the Keybase service is running, fetches upstream changes from a Git config repo, merges them (resolving conflicts), commits any local changes, and pushes everything upstream."
+description = "Daily autonomous configuration repository synchronisation. Ensures the Keybase service is running, fetches upstream changes from a Git config repo, merges them (resolving conflicts), commits any local changes, pushes everything upstream, and posts status updates to Keybase team channels. Listens to the info channel for push notifications from other instances to trigger immediate syncs."
 category = "productivity"
 icon = "\u2699\uFE0F"
 tools = [
@@ -102,11 +102,32 @@ description = "Automatically push committed local changes upstream after sync."
 setting_type = "toggle"
 default = "true"
 
+[[settings]]
+key = "keybase_team"
+label = "Keybase Team"
+description = "Keybase team for status notifications."
+setting_type = "text"
+default = "drzowbot"
+
+[[settings]]
+key = "keybase_notify"
+label = "Keybase Notifications"
+description = "Post sync status to Keybase team channels."
+setting_type = "toggle"
+default = "true"
+
+[[settings]]
+key = "listen_for_push"
+label = "Listen for Push Notifications"
+description = "Monitor the info channel for push notifications from other instances and trigger immediate sync."
+setting_type = "toggle"
+default = "true"
+
 # ─── Agent configuration ──────────────────────────────────────────────────────
 
 [agent]
 name = "config-sync-hand"
-description = "Autonomous configuration repository sync agent — ensures Keybase is running, pulls upstream config changes, merges them, commits local modifications, and pushes upstream."
+description = "Autonomous configuration repository sync agent — ensures Keybase is running, pulls upstream config changes, merges them, commits local modifications, pushes upstream, posts status updates to Keybase team channels and listens for push notifications from other instances."
 module = "builtin:chat"
 provider = "default"
 model = "default"
@@ -130,6 +151,9 @@ Run this every time you are activated (scheduled or on-demand).
    - `sync_schedule` — how often to sync
    - `merge_strategy` — how to handle conflicts
    - `auto_push` — whether to push after committing
+   - `keybase_team` — Keybase team for status notifications (default: `drzowbot`)
+   - `keybase_notify` — whether to post sync status to Keybase channels
+   - `listen_for_push` — whether to monitor #info for push notifications from other instances
 
 2. **Determine repo path**: If `CONFIG_SYNC_REPO_PATH` env var is set, use it. Otherwise fall back to the `config_repo_path` setting. If both are empty, default to `$HOME/DrZowsConfigs`.
 
@@ -207,6 +231,49 @@ Before any git operations, verify that the Keybase service is running. Many conf
 
 ---
 
+## PHASE 2.5 — Verify Keybase Channels
+
+If `keybase_notify` is enabled, verify that the configured team channels are accessible.
+
+1. **Check #info channel access**:
+   ```bash
+   keybase chat list --topic-type chat <keybase_team> 2>&1
+   ```
+
+2. **Verify #info and #alerts channels exist** in the output.
+
+3. **If channels are not accessible**, log a warning but do NOT abort:
+   ```
+   memory_store "config_sync_keybase_channel_warning" "channels not accessible on <team>: <ISO timestamp>"
+   ```
+   Continue with the sync — channel issues should not block git operations.
+
+---
+
+## PHASE 2.6 — Check for Push Notification Trigger
+
+If `listen_for_push` is enabled, check the #info channel for recent push messages from other instances before proceeding with the normal scheduled sync.
+
+1. **Read recent messages from #info**:
+   ```bash
+   keybase chat read --channel info <keybase_team> --since "1h" 2>&1
+   ```
+
+2. **Parse for push notifications** from OTHER instances:
+   Look for messages matching the pattern `config-sync (<hostname>): pushed` where `<hostname>` does NOT match our own hostname (compare against `$(hostname)`).
+
+3. **If a push notification from another instance is found**:
+   - Set `triggered_by_push = true`
+   - Log it:
+     ```
+     memory_store "config_sync_push_trigger" "triggered by push from <other_hostname> at <ISO timestamp>"
+     ```
+   - This enables event-driven sync: proceed immediately with the sync cycle regardless of schedule.
+
+4. **If no push notification found**, proceed with the normal schedule-based sync.
+
+---
+
 ## PHASE 3 — Validate Repository
 
 1. **Verify the repo path exists**:
@@ -272,7 +339,12 @@ Before any git operations, verify that the Keybase service is running. Many conf
    cd "<repo_path>" && git merge @{upstream} --no-edit 2>&1
    ```
 
-3. **If merge succeeds cleanly**, proceed to Phase 6.
+3. **If merge succeeds cleanly**:
+   - If `keybase_notify` is enabled, post to #info:
+     ```bash
+     keybase chat send --channel info <keybase_team> "config-sync ($(hostname)): pulled N commits from upstream. $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+     ```
+   - Proceed to Phase 6.
 
 4. **If merge has conflicts**, apply the configured strategy:
 
@@ -361,6 +433,10 @@ Only if `auto_push` is enabled (default: true).
    ```
    memory_store "config_sync_last_push" "<ISO timestamp>"
    ```
+   - If `keybase_notify` is enabled, post to #info:
+     ```bash
+     keybase chat send --channel info <keybase_team> "config-sync ($(hostname)): pushed N commits to <branch>. $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+     ```
 
 ---
 
@@ -375,6 +451,7 @@ After every sync cycle:
    - `config_sync_commits_pushed` — integer: cumulative commits pushed
    - `config_sync_conflicts_resolved` — integer: cumulative merge conflicts resolved
    - `config_sync_keybase_status` — string: last known Keybase status
+   - `config_sync_keybase_notifications` — integer: cumulative Keybase notifications sent
 
 2. **Persist state summary**:
    ```
@@ -407,6 +484,11 @@ memory_store "config_sync_last_error" "<type>: <message> at <ISO timestamp>"
 And if severity is high:
 ```
 event_publish "config_sync_error" { error: "<type>", message: "<message>", timestamp: "..." }
+```
+
+If `keybase_notify` is enabled, also post to #alerts with @drzow mention:
+```bash
+keybase chat send --channel alerts <keybase_team> "@drzow config-sync ($(hostname)) ERROR: <type>: <message>. $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 ```
 """
 
@@ -443,3 +525,8 @@ format = "number"
 label = "Keybase Status"
 memory_key = "config_sync_keybase_status"
 format = "text"
+
+[[dashboard.metrics]]
+label = "Keybase Notifications"
+memory_key = "config_sync_keybase_notifications"
+format = "number"

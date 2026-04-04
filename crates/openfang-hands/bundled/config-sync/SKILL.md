@@ -126,3 +126,99 @@ git commit -m "descriptive message"
 ```
 
 For config repos, `git add -A` is appropriate because all files in the repo are intended to be tracked. This is unlike source code repos where you'd be more selective.
+
+## Keybase Channel Integration
+
+### Keybase Chat CLI Reference
+
+The Keybase CLI provides chat commands for sending and reading messages in team channels.
+
+**Sending a message to a team channel**:
+```bash
+keybase chat send --channel <channel_name> <team_name> "<message>"
+```
+Example:
+```bash
+keybase chat send --channel info drzowbot "config-sync (myhost): pushed 3 commits to main. 2026-04-03T12:00:00Z"
+```
+
+**Reading recent messages from a team channel**:
+```bash
+keybase chat read --channel <channel_name> <team_name> --since "<duration>" 2>&1
+```
+Example:
+```bash
+keybase chat read --channel info drzowbot --since "1h" 2>&1
+```
+The `--since` flag accepts durations like `1h`, `30m`, `1d`.
+
+**Listing channels in a team**:
+```bash
+keybase chat list --topic-type chat <team_name>
+```
+This lists all channels the current user has access to within the team. Use it to verify that `#info` and `#alerts` channels exist before attempting to send.
+
+### Notification Patterns
+
+All notifications include the hostname via `$(hostname)` to identify which instance sent the message. This is critical for multi-instance setups.
+
+**Pull notification (posted to #info)**:
+```
+config-sync (<hostname>): pulled N commits from upstream. <ISO-8601-timestamp>
+```
+
+**Push notification (posted to #info)**:
+```
+config-sync (<hostname>): pushed N commits to <branch>. <ISO-8601-timestamp>
+```
+
+**Error alert (posted to #alerts with @mention)**:
+```
+@drzow config-sync (<hostname>) ERROR: <error_type>: <error_message>. <ISO-8601-timestamp>
+```
+
+The `@drzow` mention in error alerts ensures the user gets a Keybase notification for high-severity issues.
+
+### Push Notification Listening
+
+Other instances post push notifications to the `#info` channel. By monitoring this channel, an instance can trigger an immediate sync when another instance pushes changes, rather than waiting for its next scheduled run.
+
+**Reading recent messages**:
+```bash
+keybase chat read --channel info drzowbot --since "1h" 2>&1
+```
+
+**Parsing for push events**: Look for lines matching the pattern:
+```
+config-sync (<hostname>): pushed
+```
+
+**Filtering out own messages**: Compare the hostname in the message against the local hostname:
+```bash
+local_host=$(hostname)
+# Only react to messages where the hostname does NOT match $local_host
+```
+
+If the message hostname matches the local hostname, ignore it — that was our own push. Only messages from OTHER hostnames should trigger a sync.
+
+**Timing**: Check the #info channel at the start of each activation (Phase 2.6). If a push notification from another instance is found within the lookback window (default 1 hour), proceed with an immediate sync regardless of the normal schedule. This provides event-driven sync with the daily schedule as a fallback.
+
+### Channel Verification
+
+Before sending any notifications, verify team membership and channel access:
+
+1. **Check team membership**:
+   ```bash
+   keybase team list-memberships 2>&1 | grep <team_name>
+   ```
+
+2. **Check channel access**:
+   ```bash
+   keybase chat list --topic-type chat <team_name> 2>&1
+   ```
+   Verify that both `#info` and `#alerts` appear in the output.
+
+3. **Graceful degradation**: If channels are not accessible (team not joined, channels don't exist, Keybase not logged in), log a warning but do NOT abort the sync. Git operations are the primary mission; notifications are secondary. Store the warning:
+   ```
+   memory_store "config_sync_keybase_channel_warning" "channels not accessible on <team>: <timestamp>"
+   ```

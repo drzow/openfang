@@ -55,6 +55,11 @@ pub fn bundled_hands() -> Vec<(&'static str, &'static str, &'static str)> {
             include_str!("../bundled/config-sync/HAND.toml"),
             include_str!("../bundled/config-sync/SKILL.md"),
         ),
+        (
+            "system-update",
+            include_str!("../bundled/system-update/HAND.toml"),
+            include_str!("../bundled/system-update/SKILL.md"),
+        ),
     ]
 }
 
@@ -86,7 +91,7 @@ mod tests {
     #[test]
     fn bundled_hands_count() {
         let hands = bundled_hands();
-        assert_eq!(hands.len(), 10);
+        assert_eq!(hands.len(), 11);
     }
 
     #[test]
@@ -259,6 +264,7 @@ mod tests {
             "twitter",
             "trader",
             "config-sync",
+            "system-update",
         ];
         for (id, toml_content, skill_content) in bundled_hands() {
             if einstein_ids.contains(&id) {
@@ -292,6 +298,7 @@ mod tests {
             "twitter",
             "trader",
             "config-sync",
+            "system-update",
         ];
         for (id, toml_content, skill_content) in bundled_hands() {
             if einstein_ids.contains(&id) {
@@ -481,6 +488,65 @@ mod tests {
     }
 
     #[test]
+    fn parse_system_update_hand() {
+        let (id, toml_content, skill_content) = bundled_hands()
+            .into_iter()
+            .find(|(id, _, _)| *id == "system-update")
+            .expect("system-update hand must be in bundled_hands()");
+        let def = parse_bundled(id, toml_content, skill_content).unwrap();
+        assert_eq!(def.id, "system-update");
+        assert_eq!(def.name, "System Update Hand");
+        assert_eq!(def.category, crate::HandCategory::Productivity);
+        assert!(def.skill_content.is_some());
+        // Required binaries
+        assert!(!def.requires.is_empty());
+        let req_keys: Vec<&str> = def.requires.iter().map(|r| r.key.as_str()).collect();
+        assert!(req_keys.contains(&"sudo"), "must require sudo");
+        assert!(req_keys.contains(&"apt"), "must require apt");
+        assert!(req_keys.contains(&"keybase"), "must require keybase");
+        assert!(req_keys.contains(&"op"), "must require op");
+        assert!(req_keys.contains(&"aws"), "must require aws");
+        assert!(req_keys.contains(&"ngrok"), "must require ngrok");
+        assert!(req_keys.contains(&"rustup"), "must require rustup");
+        assert!(req_keys.contains(&"conda"), "must require conda");
+        // Einstein scheduling tools
+        assert!(def.tools.contains(&"schedule_create".to_string()));
+        assert!(def.tools.contains(&"schedule_list".to_string()));
+        assert!(def.tools.contains(&"schedule_delete".to_string()));
+        // Memory tools
+        assert!(def.tools.contains(&"memory_store".to_string()));
+        assert!(def.tools.contains(&"memory_recall".to_string()));
+        // Knowledge graph tools
+        assert!(def.tools.contains(&"knowledge_add_entity".to_string()));
+        assert!(def.tools.contains(&"knowledge_add_relation".to_string()));
+        assert!(def.tools.contains(&"knowledge_query".to_string()));
+        // Event bus
+        assert!(def.tools.contains(&"event_publish".to_string()));
+        // Shell access
+        assert!(def.tools.contains(&"shell_exec".to_string()));
+        // Dashboard
+        assert!(!def.dashboard.metrics.is_empty());
+        let metric_keys: Vec<&str> = def
+            .dashboard
+            .metrics
+            .iter()
+            .map(|m| m.memory_key.as_str())
+            .collect();
+        assert!(metric_keys.contains(&"system_update_total_updates"));
+        assert!(metric_keys.contains(&"system_update_last_update"));
+        assert!(metric_keys.contains(&"system_update_last_error"));
+        assert!(metric_keys.contains(&"system_update_packages_upgraded"));
+        assert!(metric_keys.contains(&"system_update_tools_updated"));
+        assert!(metric_keys.contains(&"system_update_held_packages"));
+        // Agent config
+        assert!(!def.agent.system_prompt.is_empty());
+        assert!(
+            def.agent.temperature < 0.2,
+            "ops hand should use low temperature"
+        );
+    }
+
+    #[test]
     fn all_einstein_hands_have_knowledge_graph() {
         let einstein_ids = [
             "lead",
@@ -490,6 +556,7 @@ mod tests {
             "twitter",
             "trader",
             "config-sync",
+            "system-update",
         ];
         for (id, toml_content, skill_content) in bundled_hands() {
             if einstein_ids.contains(&id) {
