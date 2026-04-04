@@ -153,6 +153,13 @@ description = "Update user-local tools (op, aws, ngrok, rustup, conda) in additi
 setting_type = "toggle"
 default = "true"
 
+[[settings]]
+key = "approval_mode"
+label = "Dangerous Operation Approval"
+description = "Require explicit user confirmation before running sudo commands (apt upgrade, dpkg --configure -a)."
+setting_type = "toggle"
+default = "true"
+
 # ─── Agent configuration ──────────────────────────────────────────────────────
 
 [agent]

@@ -123,6 +123,13 @@ description = "Monitor the info channel for push notifications from other instan
 setting_type = "toggle"
 default = "true"
 
+[[settings]]
+key = "approval_mode"
+label = "Push Approval"
+description = "Require explicit user confirmation before pushing changes upstream."
+setting_type = "toggle"
+default = "false"
+
 # ─── Agent configuration ──────────────────────────────────────────────────────
 
 [agent]

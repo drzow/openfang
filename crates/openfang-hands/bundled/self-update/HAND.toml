@@ -122,6 +122,13 @@ description = "Keybase team for status notifications."
 setting_type = "text"
 default = "drzowbot"
 
+[[settings]]
+key = "approval_mode"
+label = "Restart Approval"
+description = "Require explicit user confirmation before restarting the OpenFang daemon or running git reset."
+setting_type = "toggle"
+default = "true"
+
 # ─── Agent configuration ──────────────────────────────────────────────────────
 
 [agent]
