@@ -511,8 +511,11 @@ impl OpenFangKernel {
 
     /// Fetch live Copilot models by exchanging the persisted token and querying the API.
     /// Works both inside and outside a tokio runtime.
-    fn fetch_copilot_models(openfang_dir: &Path) -> Result<Vec<String>, String> {
+    fn fetch_copilot_models(
+        openfang_dir: &Path,
+    ) -> Result<Vec<openfang_runtime::provider_health::DiscoveredModel>, String> {
         use openfang_runtime::drivers::copilot;
+        use openfang_runtime::provider_health::DiscoveredModel;
 
         let tokens = copilot::PersistedTokens::load(&openfang_dir.to_path_buf())
             .ok_or("No persisted Copilot tokens found")?;
@@ -524,7 +527,13 @@ impl OpenFangKernel {
                 .map_err(|e| format!("HTTP client error: {e}"))?;
 
             let ct = copilot::exchange_copilot_token(&http, &tokens.access_token).await?;
-            copilot::fetch_models(&http, &ct.base_url, &ct.token).await
+            let model_ids = copilot::fetch_models(&http, &ct.base_url, &ct.token).await?;
+            Ok::<Vec<DiscoveredModel>, String>(
+                model_ids
+                    .into_iter()
+                    .map(|id| DiscoveredModel { id, context_window: None })
+                    .collect(),
+            )
         };
 
         // If we're already inside a tokio runtime (daemon start), use the existing one.
