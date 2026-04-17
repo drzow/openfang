@@ -11279,6 +11279,36 @@ pub async fn comms_events_stream(State(state): State<Arc<AppState>>) -> axum::re
         .into_response()
 }
 
+/// POST /api/events/publish — Publish an event to the kernel event bus.
+///
+/// Body: `{ "event_type": "my.event", "payload": { ... } }`
+pub async fn events_publish(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let event_type = match body.get("event_type").and_then(|v| v.as_str()) {
+        Some(t) => t.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Missing 'event_type' field"})),
+            );
+        }
+    };
+    let payload = body.get("payload").cloned().unwrap_or(serde_json::json!({}));
+
+    match KernelHandle::publish_event(state.kernel.as_ref(), &event_type, payload).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "published", "event_type": event_type})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Event publish failed: {e}")})),
+        ),
+    }
+}
+
 /// POST /api/comms/send — Send a message from one agent to another.
 pub async fn comms_send(
     State(state): State<Arc<AppState>>,

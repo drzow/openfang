@@ -461,7 +461,11 @@ pub async fn build_router(
             axum::routing::get(routes::comms_events_stream),
         )
         .route("/api/comms/send", axum::routing::post(routes::comms_send))
-        .route("/api/comms/task", axum::routing::post(routes::comms_task));
+        .route("/api/comms/task", axum::routing::post(routes::comms_task))
+        .route(
+            "/api/events/publish",
+            axum::routing::post(routes::events_publish),
+        );
 
     // Split into a second router chunk to stay within axum's type nesting limit.
     let app = app

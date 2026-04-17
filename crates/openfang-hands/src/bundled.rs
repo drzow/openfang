@@ -65,6 +65,11 @@ pub fn bundled_hands() -> Vec<(&'static str, &'static str, &'static str)> {
             include_str!("../bundled/self-update/HAND.toml"),
             include_str!("../bundled/self-update/SKILL.md"),
         ),
+        (
+            "timesheet-sync",
+            include_str!("../bundled/timesheet-sync/HAND.toml"),
+            include_str!("../bundled/timesheet-sync/SKILL.md"),
+        ),
     ]
 }
 
@@ -96,7 +101,7 @@ mod tests {
     #[test]
     fn bundled_hands_count() {
         let hands = bundled_hands();
-        assert_eq!(hands.len(), 12);
+        assert_eq!(hands.len(), 13);
     }
 
     #[test]
