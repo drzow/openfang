@@ -8457,6 +8457,8 @@ pub async fn create_schedule(
         );
     }
 
+    state.kernel.reconcile_schedules_into_cron();
+
     (StatusCode::CREATED, Json(entry))
 }
 
@@ -8521,6 +8523,16 @@ pub async fn update_schedule(
         );
     }
 
+    // Drop any existing cron job for this id so the reconciliation below picks up
+    // the fresh cron expression / enabled flag / agent_id / message.
+    if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+        let _ = state
+            .kernel
+            .cron_scheduler
+            .remove_job(openfang_types::scheduler::CronJobId(uuid));
+    }
+    state.kernel.reconcile_schedules_into_cron();
+
     (
         StatusCode::OK,
         Json(serde_json::json!({"status": "updated", "schedule_id": id})),
@@ -8558,6 +8570,13 @@ pub async fn delete_schedule(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to delete schedule: {e}")})),
         );
+    }
+
+    if let Ok(uuid) = uuid::Uuid::parse_str(&id) {
+        let _ = state
+            .kernel
+            .cron_scheduler
+            .remove_job(openfang_types::scheduler::CronJobId(uuid));
     }
 
     (
@@ -8633,25 +8652,11 @@ pub async fn run_schedule(
         message.to_string()
     };
 
-    // Update last_run and run_count
-    let mut schedules_updated: Vec<serde_json::Value> =
-        match state.kernel.memory.structured_get(shared_id, SCHEDULES_KEY) {
-            Ok(Some(serde_json::Value::Array(arr))) => arr,
-            _ => Vec::new(),
-        };
-    for s in schedules_updated.iter_mut() {
-        if s["id"].as_str() == Some(&id) {
-            s["last_run"] = serde_json::Value::String(chrono::Utc::now().to_rfc3339());
-            let count = s["run_count"].as_u64().unwrap_or(0);
-            s["run_count"] = serde_json::json!(count + 1);
-            break;
-        }
-    }
-    let _ = state.kernel.memory.structured_set(
-        shared_id,
-        SCHEDULES_KEY,
-        serde_json::Value::Array(schedules_updated),
-    );
+    // Stat bump goes through the kernel so it shares `schedules_stats_lock`
+    // with the cron tick loop's bump — otherwise a concurrent scheduled fire
+    // of a different entry could interleave read-modify-write of the shared
+    // schedules array and lose one update.
+    state.kernel.bump_schedule_run_stats(&id);
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
     match state

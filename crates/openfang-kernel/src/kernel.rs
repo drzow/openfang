@@ -129,6 +129,18 @@ pub struct OpenFangKernel {
     pub delivery_tracker: DeliveryTracker,
     /// Cron job scheduler.
     pub cron_scheduler: crate::cron::CronScheduler,
+    /// Serializes read-modify-write updates to the `__openfang_schedules` memory array.
+    ///
+    /// The array is stored as a single JSON value under one memory key, so every
+    /// stat bump rewrites the whole array. A scheduled fire of entry A and a
+    /// concurrent `POST /api/schedules/{B}/run` can otherwise interleave — both
+    /// read the same snapshot and both write it back, losing whichever update
+    /// landed first.
+    ///
+    /// A sync `Mutex<()>` is correct here: the critical section is a pure sync
+    /// JSON read + mutate + write with no `.await`, and contention is rare
+    /// enough that briefly serializing bursts is the desired behavior.
+    pub schedules_stats_lock: std::sync::Mutex<()>,
     /// Execution approval manager.
     pub approval_manager: crate::approval::ApprovalManager,
     /// Agent bindings for multi-account routing (Mutex for runtime add/remove).
@@ -1153,6 +1165,7 @@ impl OpenFangKernel {
             effective_mcp_servers: std::sync::RwLock::new(all_mcp_servers),
             delivery_tracker: DeliveryTracker::new(),
             cron_scheduler,
+            schedules_stats_lock: std::sync::Mutex::new(()),
             approval_manager,
             bindings: std::sync::Mutex::new(initial_bindings),
             broadcast: initial_broadcast,
@@ -3552,15 +3565,36 @@ impl OpenFangKernel {
                 heartbeat_interval_secs: def.agent.heartbeat_interval_secs.unwrap_or(30),
                 ..Default::default()
             }),
-            // Autonomous hands must run in Continuous mode so the background loop picks them up.
-            // Reactive (default) only fires on incoming messages, so autonomous hands would be inert.
-            // Default to 3600s (1 hour) to avoid wasting credits — see issue #848.
-            schedule: if def.agent.max_iterations.is_some() {
-                ScheduleMode::Continuous {
-                    check_interval_secs: 3600,
-                }
-            } else {
-                ScheduleMode::default()
+            // A hand may declare `schedule_mode = "reactive"` in [agent] to opt out of
+            // the Continuous loop when its wake-ups come from external sources
+            // (e.g. cron jobs reconciled from `__openfang_schedules`). Otherwise,
+            // `max_iterations` implies Continuous mode at a 1h interval (issue #848).
+            schedule: {
+                let explicit = match def.agent.schedule_mode.as_deref() {
+                    Some("reactive") => Some(ScheduleMode::Reactive),
+                    Some("continuous") => Some(ScheduleMode::Continuous {
+                        check_interval_secs: 3600,
+                    }),
+                    Some(other) => {
+                        warn!(
+                            hand = %hand_id,
+                            agent = %agent_name,
+                            schedule_mode = other,
+                            "Unknown schedule_mode in HAND.toml — expected \"reactive\" or \"continuous\"; falling back to default"
+                        );
+                        None
+                    }
+                    None => None,
+                };
+                explicit.unwrap_or_else(|| {
+                    if def.agent.max_iterations.is_some() {
+                        ScheduleMode::Continuous {
+                            check_interval_secs: 3600,
+                        }
+                    } else {
+                        ScheduleMode::default()
+                    }
+                })
             },
             skills: def.skills.clone(),
             mcp_servers: def.mcp_servers.clone(),
@@ -4334,6 +4368,12 @@ impl OpenFangKernel {
             }
         }
 
+        // Reconcile `__openfang_schedules` entries (created via schedule_create tool
+        // or the /api/schedules route) into the real cron_scheduler so the tick
+        // loop below actually fires them. Idempotent: skips jobs whose id matches
+        // an existing CronJob so repeated boots don't duplicate.
+        self.reconcile_schedules_into_cron();
+
         // Cron scheduler tick loop — fires due jobs every 15 seconds
         {
             let kernel = Arc::clone(self);
@@ -4354,10 +4394,12 @@ impl OpenFangKernel {
                     let due = kernel.cron_scheduler.due_jobs();
                     for job in due {
                         let job_name = job.name.clone();
+                        let job_id_str = job.id.0.to_string();
                         tracing::debug!(job = %job_name, "Cron: firing scheduled job");
                         match kernel.cron_run_job(&job).await {
                             Ok(_) => {
                                 tracing::info!(job = %job_name, "Cron job completed successfully");
+                                kernel.bump_schedule_run_stats(&job_id_str);
                             }
                             Err(e) => {
                                 tracing::warn!(job = %job_name, error = %e, "Cron job failed");
@@ -4409,6 +4451,184 @@ impl OpenFangKernel {
                 crate::whatsapp_gateway::start_whatsapp_gateway(&kernel).await;
             });
         }
+    }
+
+    /// Reconcile `__openfang_schedules` (written by the `schedule_create` tool and
+    /// `/api/schedules` route) into `cron_scheduler` so the tick loop fires them.
+    ///
+    /// Prior to this, schedules lived only as memory entries — they were listed
+    /// in the dashboard but never actually executed (issue #1069).
+    ///
+    /// Idempotent: a schedule's persisted UUID becomes the `CronJobId`, so
+    /// repeated calls (startup + post-create) skip any job already registered.
+    pub fn reconcile_schedules_into_cron(&self) -> usize {
+        use openfang_types::scheduler::{
+            CronAction, CronDelivery, CronJob, CronJobId, CronSchedule,
+        };
+
+        let shared_id = shared_memory_agent_id();
+        let entries: Vec<serde_json::Value> =
+            match self.memory.structured_get(shared_id, "__openfang_schedules") {
+                Ok(Some(serde_json::Value::Array(arr))) => arr,
+                Ok(_) => return 0,
+                Err(e) => {
+                    warn!("Failed to read __openfang_schedules for reconciliation: {e}");
+                    return 0;
+                }
+            };
+
+        let mut added = 0usize;
+        for entry in &entries {
+            if !entry["enabled"].as_bool().unwrap_or(true) {
+                continue;
+            }
+            let Some(id_str) = entry["id"].as_str() else {
+                continue;
+            };
+            let Ok(schedule_uuid) = uuid::Uuid::parse_str(id_str) else {
+                warn!("Schedule entry has non-UUID id '{id_str}', skipping");
+                continue;
+            };
+            let job_id = CronJobId(schedule_uuid);
+            if self.cron_scheduler.get_job(job_id).is_some() {
+                continue;
+            }
+
+            let Some(cron_expr) = entry["cron"].as_str() else {
+                continue;
+            };
+            let agent_ref = entry["agent_id"]
+                .as_str()
+                .or_else(|| entry["agent"].as_str())
+                .unwrap_or("");
+            let Some(agent_id) = self.resolve_agent_reference(agent_ref) else {
+                warn!(
+                    "Schedule {id_str} references unknown agent '{agent_ref}', skipping reconciliation"
+                );
+                continue;
+            };
+
+            let message = entry["message"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| entry["description"].as_str())
+                .unwrap_or("Scheduled task triggered.")
+                .to_string();
+
+            let name_field = entry["name"]
+                .as_str()
+                .or_else(|| entry["description"].as_str())
+                .unwrap_or("schedule");
+            let sanitized_name: String = name_field
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .take(128)
+                .collect();
+
+            let created_at = entry["created_at"]
+                .as_str()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(chrono::Utc::now);
+
+            let job = CronJob {
+                id: job_id,
+                agent_id,
+                name: sanitized_name,
+                enabled: true,
+                schedule: CronSchedule::Cron {
+                    expr: cron_expr.to_string(),
+                    tz: None,
+                },
+                action: CronAction::AgentTurn {
+                    message,
+                    model_override: None,
+                    timeout_secs: None,
+                },
+                delivery: CronDelivery::None,
+                created_at,
+                last_run: None,
+                next_run: None,
+            };
+
+            match self.cron_scheduler.add_job(job, false) {
+                Ok(_) => added += 1,
+                Err(e) => warn!("Failed to reconcile schedule {id_str}: {e}"),
+            }
+        }
+
+        if added > 0 {
+            info!("Reconciled {added} schedule(s) from memory into cron scheduler");
+        }
+        added
+    }
+
+    /// Update the `last_run`/`run_count` fields on a `__openfang_schedules`
+    /// entry so the dashboard reflects a firing of its backing cron job.
+    /// No-op if no entry matches `schedule_id`.
+    ///
+    /// The whole schedule array lives under a single memory key, so every
+    /// bump rewrites the full array. Two concurrent bumps (a scheduled fire
+    /// and a manual `POST /api/schedules/{id}/run` of a *different* entry)
+    /// could otherwise race on read-modify-write and lose one update.
+    /// Holding `schedules_stats_lock` across the read + mutate + write
+    /// serializes those bursts — the critical section is pure sync with no
+    /// `.await`, so a `std::sync::Mutex` is the right tool here.
+    pub fn bump_schedule_run_stats(&self, schedule_id: &str) {
+        let _guard = self
+            .schedules_stats_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let shared_id = shared_memory_agent_id();
+        let mut schedules: Vec<serde_json::Value> = match self
+            .memory
+            .structured_get(shared_id, "__openfang_schedules")
+        {
+            Ok(Some(serde_json::Value::Array(arr))) => arr,
+            _ => return,
+        };
+        let mut touched = false;
+        for entry in schedules.iter_mut() {
+            if entry["id"].as_str() == Some(schedule_id) {
+                entry["last_run"] = serde_json::Value::String(chrono::Utc::now().to_rfc3339());
+                let count = entry["run_count"].as_u64().unwrap_or(0);
+                entry["run_count"] = serde_json::json!(count + 1);
+                touched = true;
+                break;
+            }
+        }
+        if touched {
+            if let Err(e) = self.memory.structured_set(
+                shared_id,
+                "__openfang_schedules",
+                serde_json::Value::Array(schedules),
+            ) {
+                warn!("Failed to persist schedule run stats: {e}");
+            }
+        }
+    }
+
+    fn resolve_agent_reference(&self, agent_ref: &str) -> Option<AgentId> {
+        if agent_ref.is_empty() {
+            return None;
+        }
+        if let Ok(aid) = agent_ref.parse::<AgentId>() {
+            if self.registry.get(aid).is_some() {
+                return Some(aid);
+            }
+            return None;
+        }
+        self.registry
+            .list()
+            .iter()
+            .find(|a| a.name == agent_ref)
+            .map(|a| a.id)
     }
 
     /// Start the heartbeat monitor background task.
@@ -6433,6 +6653,18 @@ impl KernelHandle for OpenFangKernel {
         Ok(())
     }
 
+    fn reconcile_schedules(&self) {
+        OpenFangKernel::reconcile_schedules_into_cron(self);
+    }
+
+    fn remove_schedule_job(&self, schedule_id: &str) {
+        if let Ok(uuid) = uuid::Uuid::parse_str(schedule_id) {
+            let _ = self
+                .cron_scheduler
+                .remove_job(openfang_types::scheduler::CronJobId(uuid));
+        }
+    }
+
     async fn hand_list(&self) -> Result<Vec<serde_json::Value>, String> {
         let defs = self.hand_registry.list_definitions();
         let instances = self.hand_registry.list_instances();
@@ -7141,6 +7373,400 @@ mod tests {
             entry.manifest.tool_blocklist.is_empty(),
             "hand activation should not set a runtime blocklist by default"
         );
+
+        kernel.shutdown();
+    }
+
+    // ------------------------------------------------------------------------
+    // Schedule-executor fix (issue #1069 / #756) — tests for reconciliation,
+    // run-stat bumping, and the hand-scoped reactive override.
+    // ------------------------------------------------------------------------
+
+    fn boot_test_kernel(label: &str) -> OpenFangKernel {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join(label);
+        std::fs::create_dir_all(&home_dir).unwrap();
+        std::mem::forget(tmp); // keep tempdir alive for kernel's lifetime
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+        OpenFangKernel::boot_with_config(config).expect("kernel boot")
+    }
+
+    fn write_schedules(kernel: &OpenFangKernel, entries: serde_json::Value) {
+        kernel
+            .memory
+            .structured_set(shared_memory_agent_id(), "__openfang_schedules", entries)
+            .expect("write schedules");
+    }
+
+    fn read_schedules(kernel: &OpenFangKernel) -> Vec<serde_json::Value> {
+        match kernel
+            .memory
+            .structured_get(shared_memory_agent_id(), "__openfang_schedules")
+            .expect("read schedules")
+        {
+            Some(serde_json::Value::Array(a)) => a,
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_reconcile_schedules_registers_enabled_entries_and_is_idempotent() {
+        let kernel = boot_test_kernel("reconcile-idempotent");
+        // Activate a hand so we have a real agent to reference.
+        let instance = kernel
+            .activate_hand("browser", HashMap::new(), None)
+            .expect("browser hand should activate");
+        let agent_id = instance.agent_id.expect("agent id").to_string();
+
+        let schedule_id = uuid::Uuid::new_v4().to_string();
+        let entries = serde_json::json!([{
+            "id": schedule_id,
+            "description": "nightly sync",
+            "schedule_input": "every minute",
+            "cron": "* * * * *",
+            "agent_id": agent_id,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "enabled": true,
+        }]);
+        write_schedules(&kernel, entries);
+
+        let added_first = kernel.reconcile_schedules_into_cron();
+        assert_eq!(added_first, 1, "first pass should add one job");
+
+        // Idempotency: a second reconciliation must not duplicate.
+        let added_second = kernel.reconcile_schedules_into_cron();
+        assert_eq!(added_second, 0, "second pass should be a no-op");
+
+        let job_uuid = uuid::Uuid::parse_str(&schedule_id).unwrap();
+        assert!(
+            kernel
+                .cron_scheduler
+                .get_job(openfang_types::scheduler::CronJobId(job_uuid))
+                .is_some(),
+            "cron job for schedule must be registered"
+        );
+
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn test_reconcile_schedules_skips_disabled_entries() {
+        let kernel = boot_test_kernel("reconcile-disabled");
+        let instance = kernel
+            .activate_hand("browser", HashMap::new(), None)
+            .expect("hand activate");
+        let agent_id = instance.agent_id.expect("agent id").to_string();
+
+        let id_disabled = uuid::Uuid::new_v4().to_string();
+        let id_enabled = uuid::Uuid::new_v4().to_string();
+        let entries = serde_json::json!([
+            {
+                "id": id_disabled,
+                "description": "off",
+                "cron": "0 * * * *",
+                "agent_id": agent_id,
+                "enabled": false,
+            },
+            {
+                "id": id_enabled,
+                "description": "on",
+                "cron": "0 * * * *",
+                "agent_id": agent_id,
+                "enabled": true,
+            },
+        ]);
+        write_schedules(&kernel, entries);
+
+        let added = kernel.reconcile_schedules_into_cron();
+        assert_eq!(added, 1, "only the enabled entry should be registered");
+
+        let disabled_uuid = uuid::Uuid::parse_str(&id_disabled).unwrap();
+        let enabled_uuid = uuid::Uuid::parse_str(&id_enabled).unwrap();
+        assert!(
+            kernel
+                .cron_scheduler
+                .get_job(openfang_types::scheduler::CronJobId(disabled_uuid))
+                .is_none(),
+            "disabled schedule must not be in cron_scheduler"
+        );
+        assert!(
+            kernel
+                .cron_scheduler
+                .get_job(openfang_types::scheduler::CronJobId(enabled_uuid))
+                .is_some(),
+            "enabled schedule must be in cron_scheduler"
+        );
+
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn test_reconcile_schedules_survives_malformed_entries() {
+        let kernel = boot_test_kernel("reconcile-malformed");
+        let instance = kernel
+            .activate_hand("browser", HashMap::new(), None)
+            .expect("hand activate");
+        let agent_id = instance.agent_id.expect("agent id").to_string();
+
+        let valid_id = uuid::Uuid::new_v4().to_string();
+        let entries = serde_json::json!([
+            // Non-UUID id — skipped
+            {"id": "not-a-uuid", "cron": "* * * * *", "agent_id": agent_id, "enabled": true},
+            // Missing cron — skipped
+            {"id": uuid::Uuid::new_v4().to_string(), "agent_id": agent_id, "enabled": true},
+            // Unknown agent reference — skipped
+            {"id": uuid::Uuid::new_v4().to_string(), "cron": "* * * * *", "agent_id": "no-such-agent", "enabled": true},
+            // Invalid cron expression — add_job errors but does not panic
+            {"id": uuid::Uuid::new_v4().to_string(), "cron": "nonsense cron expr", "agent_id": agent_id, "enabled": true},
+            // Valid entry — must still register despite preceding bad entries
+            {"id": valid_id, "cron": "*/5 * * * *", "agent_id": agent_id, "enabled": true},
+        ]);
+        write_schedules(&kernel, entries);
+
+        let added = kernel.reconcile_schedules_into_cron();
+        assert_eq!(added, 1, "only the valid entry should count");
+
+        let valid_uuid = uuid::Uuid::parse_str(&valid_id).unwrap();
+        assert!(
+            kernel
+                .cron_scheduler
+                .get_job(openfang_types::scheduler::CronJobId(valid_uuid))
+                .is_some(),
+            "valid schedule after malformed ones must still register"
+        );
+
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn test_bump_schedule_run_stats_increments_and_stamps() {
+        let kernel = boot_test_kernel("bump-stats");
+        let instance = kernel
+            .activate_hand("browser", HashMap::new(), None)
+            .expect("hand activate");
+        let agent_id = instance.agent_id.expect("agent id").to_string();
+
+        let schedule_id = uuid::Uuid::new_v4().to_string();
+        let entries = serde_json::json!([{
+            "id": schedule_id,
+            "description": "test",
+            "cron": "0 * * * *",
+            "agent_id": agent_id,
+            "enabled": true,
+            "run_count": 0,
+        }]);
+        write_schedules(&kernel, entries);
+
+        kernel.bump_schedule_run_stats(&schedule_id);
+        kernel.bump_schedule_run_stats(&schedule_id);
+
+        let after = read_schedules(&kernel);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0]["run_count"].as_u64(), Some(2));
+        assert!(
+            after[0]["last_run"].as_str().is_some(),
+            "last_run should be populated after bump"
+        );
+        // Parseable as RFC3339.
+        chrono::DateTime::parse_from_rfc3339(after[0]["last_run"].as_str().unwrap())
+            .expect("last_run must be RFC3339");
+
+        // No-op for unknown id — state must be unchanged.
+        let unknown = uuid::Uuid::new_v4().to_string();
+        kernel.bump_schedule_run_stats(&unknown);
+        let still = read_schedules(&kernel);
+        assert_eq!(still[0]["run_count"].as_u64(), Some(2));
+
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn test_reconcile_schedules_resolves_agent_by_name() {
+        let kernel = boot_test_kernel("reconcile-agent-name");
+        let instance = kernel
+            .activate_hand("browser", HashMap::new(), None)
+            .expect("hand activate");
+        let agent_id = instance.agent_id.expect("agent id");
+        let agent_entry = kernel.registry.get(agent_id).expect("entry");
+        let agent_name = agent_entry.name.clone();
+
+        let schedule_id = uuid::Uuid::new_v4().to_string();
+        let entries = serde_json::json!([{
+            "id": schedule_id,
+            "description": "by name",
+            "cron": "0 * * * *",
+            // Use name instead of UUID — reconciliation should resolve it.
+            "agent": agent_name,
+            "enabled": true,
+        }]);
+        write_schedules(&kernel, entries);
+
+        let added = kernel.reconcile_schedules_into_cron();
+        assert_eq!(added, 1, "agent-by-name resolution should work");
+
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn test_hand_reactive_mode_overrides_max_iterations() {
+        // Regression for #756 — a hand with `schedule_mode = "reactive"` must
+        // NOT be forced into Continuous mode just because `max_iterations` is
+        // set. This covers the timesheet-sync case: autonomous iterations per
+        // wake-up, but wake-ups come from an external cron.
+        let kernel = boot_test_kernel("reactive-override");
+
+        // timesheet-sync declares schedule_mode = "reactive" + max_iterations = 80.
+        // If any hands system precondition fails in the test env, fall back to
+        // asserting via the browser hand with an injected manifest is out of
+        // scope here — we only need to verify the mapping logic.
+        let instance = kernel
+            .activate_hand("timesheet-sync", HashMap::new(), None)
+            .expect("timesheet-sync hand should activate");
+        let agent_id = instance.agent_id.expect("agent id");
+        let entry = kernel.registry.get(agent_id).expect("entry");
+
+        assert!(
+            matches!(entry.manifest.schedule, ScheduleMode::Reactive),
+            "schedule_mode=\"reactive\" must override max_iterations ({:?})",
+            entry.manifest.schedule
+        );
+
+        kernel.shutdown();
+    }
+
+    // ------------------------------------------------------------------------
+    // Hardening delta tests (task #5) — concurrent bump-stats + unknown
+    // schedule_mode fallback.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_bump_schedule_run_stats_concurrent_no_lost_updates() {
+        // Spawn many threads each bumping the same entry repeatedly. Under the
+        // old lock-free read-modify-write we'd lose updates; with
+        // `schedules_stats_lock`, the final run_count must equal the exact
+        // number of bump calls.
+        use std::sync::Arc;
+
+        let kernel = Arc::new(boot_test_kernel("concurrent-bump"));
+        // Seed: three distinct entries (so we also exercise the linear scan).
+        let id_a = uuid::Uuid::new_v4().to_string();
+        let id_b = uuid::Uuid::new_v4().to_string();
+        let id_c = uuid::Uuid::new_v4().to_string();
+        let entries = serde_json::json!([
+            {"id": id_a, "cron": "0 * * * *", "agent_id": "", "enabled": true, "run_count": 0},
+            {"id": id_b, "cron": "0 * * * *", "agent_id": "", "enabled": true, "run_count": 0},
+            {"id": id_c, "cron": "0 * * * *", "agent_id": "", "enabled": true, "run_count": 0},
+        ]);
+        write_schedules(&kernel, entries);
+
+        // 32 threads, 50 bumps each, round-robin across the three ids.
+        let threads = 32;
+        let per_thread = 50;
+        let ids = [id_a.clone(), id_b.clone(), id_c.clone()];
+        let mut handles = Vec::with_capacity(threads);
+        for t in 0..threads {
+            let k = Arc::clone(&kernel);
+            let ids = ids.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..per_thread {
+                    let idx = (t + i) % ids.len();
+                    k.bump_schedule_run_stats(&ids[idx]);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread join");
+        }
+
+        // Count per-id the expected number of hits.
+        let mut expected = [0u64; 3];
+        for t in 0..threads {
+            for i in 0..per_thread {
+                expected[(t + i) % 3] += 1;
+            }
+        }
+        let total_expected: u64 = expected.iter().sum();
+        assert_eq!(
+            total_expected,
+            (threads * per_thread) as u64,
+            "sanity — expected counts must equal total bump invocations"
+        );
+
+        let after = read_schedules(&kernel);
+        let mut got = [0u64; 3];
+        for entry in &after {
+            let id = entry["id"].as_str().unwrap();
+            let rc = entry["run_count"].as_u64().unwrap_or(0);
+            if id == id_a {
+                got[0] = rc;
+            } else if id == id_b {
+                got[1] = rc;
+            } else if id == id_c {
+                got[2] = rc;
+            }
+        }
+        assert_eq!(
+            got, expected,
+            "concurrent bumps must not lose updates — got {got:?}, expected {expected:?}",
+        );
+
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn test_hand_unknown_schedule_mode_falls_back_and_warns() {
+        // An unknown `schedule_mode` string (typo, future value, etc.) must
+        // NOT explode; it must fall back to the `max_iterations`-driven default
+        // and surface a warn log. This test asserts the observable fallback
+        // behavior — a bogus "reactve" (typo) with max_iterations=5 must still
+        // produce Continuous mode (the fallback path), not Reactive (which
+        // would happen if the unknown string were silently treated as
+        // reactive) and not a panic.
+        let kernel = boot_test_kernel("unknown-schedule-mode");
+
+        let toml = r#"
+id = "bogus-mode-hand"
+name = "Bogus Mode Hand"
+description = "Test hand with an invalid schedule_mode value"
+category = "productivity"
+
+tools = []
+skills = []
+mcp_servers = []
+
+[agent]
+name = "bogus-mode-agent"
+description = "tester"
+module = "builtin:chat"
+provider = "default"
+model = "default"
+max_tokens = 1024
+temperature = 0.1
+max_iterations = 5
+schedule_mode = "reactve"
+system_prompt = "you are a test agent"
+"#;
+        kernel
+            .hand_registry
+            .install_from_content(toml, "")
+            .expect("install bogus-mode-hand");
+
+        let instance = kernel
+            .activate_hand("bogus-mode-hand", HashMap::new(), None)
+            .expect("activate");
+        let agent_id = instance.agent_id.expect("agent id");
+        let entry = kernel.registry.get(agent_id).expect("entry");
+
+        match entry.manifest.schedule {
+            ScheduleMode::Continuous { .. } => { /* fallback path taken */ }
+            other => panic!(
+                "unknown schedule_mode must fall back to Continuous (max_iterations=5 set), got {other:?}"
+            ),
+        }
 
         kernel.shutdown();
     }

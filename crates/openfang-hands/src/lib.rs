@@ -298,6 +298,12 @@ pub struct HandAgentConfig {
     /// making long LLM calls. Omit to use the kernel default.
     #[serde(default)]
     pub heartbeat_interval_secs: Option<u64>,
+    /// Explicit schedule mode override: "reactive" | "continuous".
+    /// When set, the kernel uses this instead of inferring Continuous from
+    /// `max_iterations` — lets hands declare autonomy without a self-driven
+    /// loop (e.g. hands driven by external `__openfang_schedules` entries).
+    #[serde(default)]
+    pub schedule_mode: Option<String>,
 }
 
 fn default_module() -> String {

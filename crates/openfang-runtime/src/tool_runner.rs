@@ -2127,6 +2127,7 @@ async fn tool_schedule_create(
 
     schedules.push(entry);
     kh.memory_store(SCHEDULES_KEY, serde_json::Value::Array(schedules))?;
+    kh.reconcile_schedules();
 
     Ok(format!(
         "Schedule created:\n  ID: {schedule_id}\n  Description: {description}\n  Cron: {cron_expr}\n  Original: {schedule_str}"
@@ -2182,6 +2183,7 @@ async fn tool_schedule_delete(
     }
 
     kh.memory_store(SCHEDULES_KEY, serde_json::Value::Array(schedules))?;
+    kh.remove_schedule_job(id);
     Ok(format!("Schedule '{id}' deleted."))
 }
 
@@ -4190,5 +4192,180 @@ mod tests {
         assert!(is_shell_tool("process_start"));
         assert!(!is_shell_tool("file_read"));
         assert!(!is_shell_tool("web_fetch"));
+    }
+
+    // ------------------------------------------------------------------------
+    // Schedule-executor fix (issue #1069) — schedule_create/delete tools must
+    // re-reconcile the kernel cron scheduler so new/removed schedule entries
+    // start/stop firing without a daemon restart.
+    // ------------------------------------------------------------------------
+
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MockKernelHandle {
+        store: Mutex<std::collections::HashMap<String, serde_json::Value>>,
+        reconcile_calls: std::sync::atomic::AtomicUsize,
+        remove_calls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl crate::kernel_handle::KernelHandle for MockKernelHandle {
+        async fn spawn_agent(
+            &self,
+            _m: &str,
+            _p: Option<&str>,
+        ) -> Result<(String, String), String> {
+            Err("unused".into())
+        }
+        async fn send_to_agent(&self, _a: &str, _m: &str) -> Result<String, String> {
+            Err("unused".into())
+        }
+        fn list_agents(&self) -> Vec<crate::kernel_handle::AgentInfo> {
+            vec![]
+        }
+        fn kill_agent(&self, _a: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn memory_store(&self, key: &str, value: serde_json::Value) -> Result<(), String> {
+            self.store.lock().unwrap().insert(key.to_string(), value);
+            Ok(())
+        }
+        fn memory_recall(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
+            Ok(self.store.lock().unwrap().get(key).cloned())
+        }
+        fn find_agents(&self, _q: &str) -> Vec<crate::kernel_handle::AgentInfo> {
+            vec![]
+        }
+        async fn task_post(
+            &self,
+            _t: &str,
+            _d: &str,
+            _a: Option<&str>,
+            _c: Option<&str>,
+        ) -> Result<String, String> {
+            Err("unused".into())
+        }
+        async fn task_claim(
+            &self,
+            _a: &str,
+        ) -> Result<Option<serde_json::Value>, String> {
+            Ok(None)
+        }
+        async fn task_complete(&self, _id: &str, _r: &str) -> Result<(), String> {
+            Ok(())
+        }
+        async fn task_list(
+            &self,
+            _s: Option<&str>,
+        ) -> Result<Vec<serde_json::Value>, String> {
+            Ok(vec![])
+        }
+        async fn publish_event(
+            &self,
+            _t: &str,
+            _p: serde_json::Value,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn knowledge_add_entity(
+            &self,
+            _e: openfang_types::memory::Entity,
+        ) -> Result<String, String> {
+            Err("unused".into())
+        }
+        async fn knowledge_add_relation(
+            &self,
+            _r: openfang_types::memory::Relation,
+        ) -> Result<String, String> {
+            Err("unused".into())
+        }
+        async fn knowledge_query(
+            &self,
+            _p: openfang_types::memory::GraphPattern,
+        ) -> Result<Vec<openfang_types::memory::GraphMatch>, String> {
+            Ok(vec![])
+        }
+
+        fn reconcile_schedules(&self) {
+            self.reconcile_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn remove_schedule_job(&self, schedule_id: &str) {
+            self.remove_calls
+                .lock()
+                .unwrap()
+                .push(schedule_id.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_schedule_create_tool_invokes_reconcile() {
+        let mock = Arc::new(MockKernelHandle::default());
+        let mock_handle: Arc<dyn crate::kernel_handle::KernelHandle> = mock.clone();
+
+        let input = serde_json::json!({
+            "description": "nightly thing",
+            "schedule": "* * * * *",
+            "agent": "",
+        });
+        let res = tool_schedule_create(&input, Some(&mock_handle)).await;
+        assert!(res.is_ok(), "schedule_create should succeed: {res:?}");
+
+        assert_eq!(
+            mock.reconcile_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "schedule_create must call reconcile_schedules exactly once"
+        );
+
+        let stored = mock
+            .store
+            .lock()
+            .unwrap()
+            .get(SCHEDULES_KEY)
+            .cloned()
+            .expect("schedules persisted");
+        let arr = stored.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["enabled"].as_bool(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_schedule_delete_tool_invokes_remove_schedule_job() {
+        let mock = Arc::new(MockKernelHandle::default());
+        let mock_handle: Arc<dyn crate::kernel_handle::KernelHandle> = mock.clone();
+
+        let existing_id = uuid::Uuid::new_v4().to_string();
+        let entries = serde_json::json!([{
+            "id": existing_id,
+            "description": "test",
+            "cron": "0 * * * *",
+            "agent": "",
+            "enabled": true,
+        }]);
+        mock_handle.memory_store(SCHEDULES_KEY, entries).unwrap();
+
+        let input = serde_json::json!({"id": existing_id});
+        let res = tool_schedule_delete(&input, Some(&mock_handle)).await;
+        assert!(res.is_ok(), "schedule_delete should succeed: {res:?}");
+
+        let removes = mock.remove_calls.lock().unwrap().clone();
+        assert_eq!(
+            removes,
+            vec![existing_id.clone()],
+            "schedule_delete must invoke remove_schedule_job with the deleted id"
+        );
+
+        let stored = mock
+            .store
+            .lock()
+            .unwrap()
+            .get(SCHEDULES_KEY)
+            .cloned()
+            .unwrap();
+        assert!(stored.as_array().unwrap().is_empty());
     }
 }

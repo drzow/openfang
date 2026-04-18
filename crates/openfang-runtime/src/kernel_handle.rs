@@ -105,6 +105,16 @@ pub trait KernelHandle: Send + Sync {
         Err("Cron scheduler not available".to_string())
     }
 
+    /// Reconcile `__openfang_schedules` memory entries into the kernel cron
+    /// scheduler so newly-created schedules fire without a daemon restart.
+    fn reconcile_schedules(&self) {}
+
+    /// Remove the cron job backing a `__openfang_schedules` entry, keyed by its
+    /// schedule id (UUID). No-op if no matching job exists.
+    fn remove_schedule_job(&self, schedule_id: &str) {
+        let _ = schedule_id;
+    }
+
     /// List cron jobs for the calling agent.
     async fn cron_list(&self, agent_id: &str) -> Result<Vec<serde_json::Value>, String> {
         let _ = agent_id;
